@@ -57,7 +57,7 @@
           pointcloud: false
         check_outside: # If true, the planner checks if the obstacle is outside the ego's footprint. pointcloud obstacles are not supported.
           default: true
-          unknown: false
+          unknown: true  # 2026-05-23: was false — unknown clusters (trees, poles, chairs) must trigger stop even when outside footprint
 
         trim_trajectory:
           enable_trimming:
