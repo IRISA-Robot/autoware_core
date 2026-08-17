@@ -2286,6 +2286,20 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
   double min_route_cost = std::numeric_limits<double>::max();
   constexpr double yaw_threshold = M_PI / 2.0;
   constexpr double angle_diff_weight = 1000.0;
+  // [BIDIR-BUG-FIX] Live-test evidence (2026-08-17): forward candidate length2d=64.60 vs
+  // reverse-start+reverse-goal candidate length2d=62.50 for the same start/goal -- reverse won
+  // the raw cost comparison by a razor-thin 3.4% margin, even though reversing has real practical
+  // costs a plain 2D path-length metric can't see (lower speed limit while reversing, must
+  // decelerate to near-zero before/after the maneuver, harder to control precisely, awkward for
+  // a human observer). Without a penalty, the router will flip-flop to reverse for ANY marginal
+  // length advantage, however tiny -- reverse should only ever be chosen when it is SUBSTANTIALLY
+  // shorter than the forward alternative, not just nominally shorter. Multiplicatively penalize
+  // reverse-start candidate lengths before they compete with the forward cost below; a forward
+  // route must be more than this factor longer than a reverse one before reverse is allowed to
+  // win. Hardcoded here (matching this function's existing inline-constexpr style for
+  // yaw_threshold/angle_diff_weight) rather than wired through a new ROS param -- revisit via
+  // tuning-engineer + a proper param if the exact factor needs field-tuning.
+  constexpr double reverse_route_length_penalty_factor = 1.5;
 
   for (const auto & st_llt : start_lanelets) {
     // check if the angle difference between start_checkpoint and start lanelet center line
@@ -2429,7 +2443,8 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
         // rerouting semantics, and without ever letting a reverse-start pre-empt a valid
         // forward continuity match.
         const double inv_route_length = inv_optional_route->length2d();
-        const double inv_route_cost = inv_route_length + angle_diff_weight * angle_diff;
+        const double inv_route_cost =
+          reverse_route_length_penalty_factor * inv_route_length + angle_diff_weight * angle_diff;
         RCLCPP_DEBUG(
           logger_,
           "Lanelet ID %ld (inverted / reverse-start): Route length = %.1f, Angle Diff = %.4f "
@@ -2494,7 +2509,8 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
           is_route_found = true;
           const double inv_goal_route_length = inv_goal_optional_route->length2d();
           const double inv_goal_route_cost =
-            inv_goal_route_length + angle_diff_weight * angle_diff;
+            reverse_route_length_penalty_factor * inv_goal_route_length +
+            angle_diff_weight * angle_diff;
           RCLCPP_DEBUG(
             logger_,
             "Lanelet ID %ld (inverted start + inverted goal, direct reverse): Route length = "
