@@ -463,7 +463,18 @@ bool RouteHandler::isBidirectionalDrivingLanelet(const lanelet::ConstLanelet & l
 {
   // Idiom follows the existing custom-tag convention in this file, see isNoDrivableLane()
   // (attributeOr("no_drivable_lane", "no")).
-  return llt.attributeOr("bidirectional_driving", "no") == "yes";
+  //
+  // IMPORTANT: attributeOr<T>() deduces T from the literal type of the default value. A bare
+  // `"no"` is a `const char*`, so `attributeOr("bidirectional_driving", "no") == "yes"` compared
+  // two `const char*` POINTERS (address comparison), not their string content -- always false in
+  // practice, regardless of the actual tag value. isNoDrivableLane() avoided this bug only by
+  // accident, via an intermediate `const std::string` variable that implicitly converts the
+  // `const char*` result before the `==` comparison. Do that explicitly here too (found via live
+  // testing: the attribute was confirmed present with value "yes" at runtime, yet this function
+  // still returned false before this fix).
+  const std::string bidirectional_driving_attribute =
+    llt.attributeOr("bidirectional_driving", "no");
+  return bidirectional_driving_attribute == "yes";
 }
 
 bool RouteHandler::hasDeferredRegulatoryElementForReverse(const lanelet::ConstLanelet & llt)
@@ -2244,6 +2255,12 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
     bool is_proper_angle = angle_diff <= std::abs(yaw_threshold);
 
     optional_route = routing_graph_ptr_->getRoute(st_llt, goal_lanelet, 0);
+    RCLCPP_WARN(
+      logger_,
+      "[BIDIR-DEBUG] forward candidate: st_llt=%ld found=%s is_proper_angle=%s angle_diff_deg=%.2f "
+      "length2d=%.2f",
+      st_llt.id(), (optional_route ? "true" : "false"), (is_proper_angle ? "true" : "false"),
+      angle_diff * 180.0 / M_PI, (optional_route ? optional_route->length2d() : -1.0));
     if (!optional_route || !is_proper_angle) {
       RCLCPP_DEBUG_STREAM(
         logger_, "Failed to find a proper route!"
@@ -2289,6 +2306,26 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
     // getRoute() call on a start orientation that would just be rejected afterward anyway, and so
     // this seeding step stays policy-consistent with the gate that already governs mid-path
     // inversions.
+    {
+      const bool dbg_allow_reverse_route = allow_reverse_route_;
+      const bool dbg_is_bidir_start = isBidirectionalDrivingLanelet(st_llt);
+      const bool dbg_not_deferred_start = !hasDeferredRegulatoryElementForReverse(st_llt);
+      RCLCPP_WARN(
+        logger_,
+        "[BIDIR-DEBUG] reverse-start gate: st_llt=%ld allow_reverse_route_=%s "
+        "isBidirectionalDrivingLanelet=%s !hasDeferredRegulatoryElementForReverse=%s",
+        st_llt.id(), (dbg_allow_reverse_route ? "true" : "false"),
+        (dbg_is_bidir_start ? "true" : "false"), (dbg_not_deferred_start ? "true" : "false"));
+      // [BIDIR-DEBUG] dump the FULL attribute map seen at runtime for st_llt, to settle
+      // definitively whether "bidirectional_driving" is present/absent/mismatched.
+      std::stringstream dbg_attrs_ss;
+      for (const auto & kv : st_llt.attributes()) {
+        dbg_attrs_ss << kv.first << "='" << kv.second.value() << "' ";
+      }
+      RCLCPP_WARN(
+        logger_, "[BIDIR-DEBUG] full attribute dump for st_llt=%ld: %s", st_llt.id(),
+        dbg_attrs_ss.str().c_str());
+    }
     if (
       allow_reverse_route_ && isBidirectionalDrivingLanelet(st_llt) &&
       !hasDeferredRegulatoryElementForReverse(st_llt)) {
@@ -2321,6 +2358,16 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
       // (versus the 88.4-length 5-hop forward loop), proving the routing graph was never the
       // problem.
       const auto inv_optional_route = routing_graph_ptr_->getRoute(inv_llt, goal_lanelet, 0);
+      RCLCPP_WARN(
+        logger_,
+        "[BIDIR-DEBUG] reverse-start candidate (inv_llt -> goal_lanelet): st_llt=%ld found=%s "
+        // NOTE: lanelet::routing::Route has no public cost() accessor -- length2d() is the only
+        // scalar route-cost proxy exposed by the lanelet2_routing API, so cost is approximated
+        // downstream via `length2d + angle_diff_weight * angle_diff` (see optional_route_cost /
+        // inv_route_cost just below) rather than logged directly here.
+        "length2d=%.2f",
+        st_llt.id(), (inv_optional_route ? "true" : "false"),
+        (inv_optional_route ? inv_optional_route->length2d() : -1.0));
       if (inv_optional_route && is_proper_angle) {
         is_route_found = true;
 
@@ -2378,11 +2425,27 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
       // ForReverse(), so no separate eligibility pre-check on goal_lanelet is required for
       // correctness (only skipped here as a minor optimization, mirroring the start-side gate,
       // to avoid a doomed getRoute() call).
+      {
+        const bool dbg_is_bidir_goal = isBidirectionalDrivingLanelet(goal_lanelet);
+        const bool dbg_not_deferred_goal = !hasDeferredRegulatoryElementForReverse(goal_lanelet);
+        RCLCPP_WARN(
+          logger_,
+          "[BIDIR-DEBUG] reverse-goal gate: st_llt=%ld goal_lanelet=%ld "
+          "isBidirectionalDrivingLanelet(goal)=%s !hasDeferredRegulatoryElementForReverse(goal)=%s",
+          st_llt.id(), goal_lanelet.id(), (dbg_is_bidir_goal ? "true" : "false"),
+          (dbg_not_deferred_goal ? "true" : "false"));
+      }
       if (
         isBidirectionalDrivingLanelet(goal_lanelet) &&
         !hasDeferredRegulatoryElementForReverse(goal_lanelet)) {
         const lanelet::ConstLanelet inv_goal_llt = goal_lanelet.invert();
         const auto inv_goal_optional_route = routing_graph_ptr_->getRoute(inv_llt, inv_goal_llt, 0);
+        RCLCPP_WARN(
+          logger_,
+          "[BIDIR-DEBUG] reverse-start+reverse-goal candidate (inv_llt -> inv_goal_llt): "
+          "st_llt=%ld found=%s length2d=%.2f",
+          st_llt.id(), (inv_goal_optional_route ? "true" : "false"),
+          (inv_goal_optional_route ? inv_goal_optional_route->length2d() : -1.0));
         if (inv_goal_optional_route && is_proper_angle) {
           is_route_found = true;
           const double inv_goal_route_length = inv_goal_optional_route->length2d();
@@ -2476,6 +2539,16 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
                  << " - goal checkpoint: " << toString(goal_checkpoint) << std::endl
                  << " - start lane ids: " << convertLaneletsIdToString(start_lanelets) << std::endl
                  << " - goal lane id: " << goal_lanelet.id() << std::endl);
+  }
+
+  {
+    std::stringstream dbg_path_ss;
+    for (const auto & llt : *path_lanelets) {
+      dbg_path_ss << llt.id() << (llt.inverted() ? "(inv)" : "(fwd)") << " ";
+    }
+    RCLCPP_WARN(
+      logger_, "[BIDIR-DEBUG] final path_lanelets (is_route_found=%s): [ %s]",
+      (is_route_found ? "true" : "false"), dbg_path_ss.str().c_str());
   }
 
   return is_route_found;
