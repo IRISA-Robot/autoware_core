@@ -1942,11 +1942,28 @@ std::vector<Waypoints> RouteHandler::calcWaypointsVector(
     }
 
     // generate piecewise waypoints
+    //
+    // BIDIR-BUG-FIX: lineStringLayer.get(waypoints_id) always yields the waypoints linestring in
+    // the order it was authored in the map (i.e. matching the lanelet's *forward* direction),
+    // completely independent of whether `lanelet` here is an inverted ConstLanelet view. This is
+    // the same re-fetch-by-id direction-loss bug class already fixed in route_handler.cpp for
+    // route_lanelets_/getNextLanelets()/getPreviousLanelets(), just never audited in this
+    // function. Left unfixed, a reversed-in-route lanelet carrying an explicit "waypoints"
+    // override (typically used on curves, exactly where auto-centerline flipping isn't enough)
+    // would have its waypoint reference points ordered backwards relative to the actual direction
+    // of travel, producing an erratic/self-crossing reference path on that lanelet while adjacent
+    // plain-centerline lanelets look fine -- matching the reported "trajectory doesn't follow the
+    // reversed lanelet, sometimes erratic" symptom.
     PiecewiseWaypoints piecewise_waypoints{lanelet.id(), {}};
     const auto waypoints_id = lanelet.attribute("waypoints").asId().value();
     for (const auto & waypoint : lanelet_map_ptr_->lineStringLayer.get(waypoints_id)) {
       piecewise_waypoints.piecewise_waypoints.push_back(
         lanelet::utils::conversion::toGeomMsgPt(waypoint));
+    }
+    if (lanelet.inverted()) {
+      std::reverse(
+        piecewise_waypoints.piecewise_waypoints.begin(),
+        piecewise_waypoints.piecewise_waypoints.end());
     }
     if (piecewise_waypoints.piecewise_waypoints.empty()) {
       continue;
