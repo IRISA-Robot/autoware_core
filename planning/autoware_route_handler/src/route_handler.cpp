@@ -702,14 +702,41 @@ lanelet::ConstLanelets RouteHandler::getLaneletsFromIds(const lanelet::Ids & ids
   lanelet::ConstLanelets lanelets;
   lanelets.reserve(ids.size());
   for (const auto & id : ids) {
-    lanelets.push_back(lanelet_map_ptr_->laneletLayer.get(id));
+    lanelets.push_back(getLaneletsFromId(id));
   }
   return lanelets;
 }
 
 lanelet::ConstLanelet RouteHandler::getLaneletsFromId(const lanelet::Id id) const
 {
-  return lanelet_map_ptr_->laneletLayer.get(id);
+  // [BIDIR-BUG-FIX] laneletLayer.get(id) always yields the map-authored forward view, silently
+  // discarding whatever direction this lanelet was actually traversed in the active route (the
+  // same "re-fetch-by-id discards .inverted()" bug class already fixed 5x in this file, e.g.
+  // constructRouteLaneletsFromCheckpoints() re-applying reversed_in_route_ when rebuilding
+  // route_lanelets_ by id). Callers of this accessor (e.g. getLaneletsFromPath() /
+  // get_lanelet_sequence_from_path() in behavior_path_planner_common's utils.cpp, feeding
+  // generateDrivableLanes()) rely on the returned ConstLanelet's own leftBound3d()/
+  // rightBound3d() to build the drivable-area boundary polygon in travel order; if this
+  // lanelet was actually traversed inverted in the route, that boundary comes out
+  // forward-oriented instead, producing a discontinuous / self-intersecting drivable area on
+  // reversed-lanelet segments -- plausible root cause of "trajectory ngawur" on bidirectional
+  // routes. Re-apply the tracked direction the same way setRouteLanelets() does when
+  // re-fetching route_lanelets_ by id.
+  const lanelet::ConstLanelet forward_llt = lanelet_map_ptr_->laneletLayer.get(id);
+  const auto reversed_it = reversed_in_route_.find(id);
+  if (reversed_it != reversed_in_route_.end() && reversed_it->second) {
+    // Throttled: this accessor is called every planning cycle for every lanelet id in the
+    // path (e.g. via get_lanelet_sequence_from_path()), so an unthrottled WARN here would
+    // flood the log on any route containing a reversed segment.
+    static rclcpp::Clock clock{RCL_ROS_TIME};
+    RCLCPP_WARN_THROTTLE(
+      logger_, clock, 1000,
+      "[BIDIR-DEBUG] getLaneletsFromId: id=%ld re-applying inverted orientation "
+      "(reversed_in_route_) that laneletLayer.get() would otherwise have discarded",
+      id);
+    return forward_llt.invert();
+  }
+  return forward_llt;
 }
 
 bool RouteHandler::isDeadEndLanelet(const lanelet::ConstLanelet & lanelet) const
