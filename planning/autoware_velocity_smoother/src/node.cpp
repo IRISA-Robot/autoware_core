@@ -497,12 +497,124 @@ void VelocitySmootherNode::onCurrentTrajectory(const Trajectory::ConstSharedPtr 
 
   // For negative velocity handling, multiple -1 to velocity if it is for reverse.
   // NOTE: this process must be in the beginning of the process
-  is_reverse_ = isReverse(input_points);
-  if (is_reverse_) {
-    flipVelocity(input_points);
+  //
+  // In bidirectional-driving, a single trajectory message may legitimately contain both a
+  // forward-direction run and a reverse-direction run of points in the same array (e.g. when the
+  // planning horizon spans a forward<->reverse transition). The classic whole-array
+  // isReverse()/flipVelocity() approach assumes the whole array is uniformly one direction; naively
+  // applying it to a mixed-sign array would flip legitimately-forward points to negative (and vice
+  // versa) before smoothing, garbling the accel/jerk-limited optimization right at the transition.
+  // Detect contiguous sign-runs up front and, if there's more than one, smooth each run
+  // independently (segment-aware path). If there's only a single run (the common, non-bidirectional
+  // case), fall through to the original whole-array logic unchanged.
+  const auto sign_runs = splitBySignRuns(input_points);
+
+  TrajectoryPoints output;
+  bool did_segment_split = false;
+
+  if (sign_runs.size() <= 1) {
+    // Fast path: identical to the original behavior when there's no direction transition.
+    is_reverse_ = isReverse(input_points);
+    if (is_reverse_) {
+      flipVelocity(input_points);
+    }
+
+    output = calcTrajectoryVelocity(input_points);
+  } else {
+    did_segment_split = true;
+
+    const size_t global_closest = findNearestIndexFromEgo(input_points);
+    size_t active_run = 0;
+    for (size_t i = 0; i < sign_runs.size(); ++i) {
+      if (global_closest >= sign_runs.at(i).first && global_closest <= sign_runs.at(i).second) {
+        active_run = i;
+        break;
+      }
+    }
+
+    {
+      std::string boundary_log;
+      for (const auto & run : sign_runs) {
+        boundary_log += "[" + std::to_string(run.first) + "," + std::to_string(run.second) +
+                         "](v_start=" +
+                         std::to_string(input_points.at(run.first).longitudinal_velocity_mps) +
+                         ",v_end=" +
+                         std::to_string(input_points.at(run.second).longitudinal_velocity_mps) +
+                         ") ";
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *clock_, 3000,
+        "[BIDIR-DEBUG] mixed-sign trajectory detected: %zu segments, active_run=%zu (ego closest "
+        "idx=%zu). segments: %s",
+        sign_runs.size(), active_run, global_closest, boundary_log.c_str());
+    }
+
+    // Preserve the node-level "previous cycle" state so it can be restored after we temporarily
+    // repurpose it for the non-active segments below.
+    const auto saved_closest_point_from_prev_output = current_closest_point_from_prev_output_;
+
+    for (size_t i = 0; i < sign_runs.size(); ++i) {
+      const auto & run = sign_runs.at(i);
+      TrajectoryPoints seg(
+        input_points.begin() + run.first, input_points.begin() + run.second + 1);
+
+      // Anchor the internal (shared) boundary points at 0 velocity so each segment's smoothing
+      // has a clean near-stop anchor at the forward<->reverse transition -- matching the existing
+      // "input_points.back().longitudinal_velocity_mps = 0.0" idiom already used for the true end
+      // of the whole trajectory.
+      if (i > 0) {
+        seg.front().longitudinal_velocity_mps = 0.0;
+      }
+      if (i + 1 < sign_runs.size()) {
+        seg.back().longitudinal_velocity_mps = 0.0;
+      }
+
+      // Only the segment containing ego's current position should use the previous cycle's
+      // tracked state (current_closest_point_from_prev_output_); the other segments are not where
+      // ego currently is, so that state is not meaningful for them -- give them a neutral/default
+      // initial condition instead (this makes calcInitialMotion() fall back to its "first time"
+      // branch, i.e. plan from current ego speed with zero acceleration).
+      current_closest_point_from_prev_output_ =
+        (i == active_run) ? saved_closest_point_from_prev_output : boost::none;
+
+      is_reverse_ = isReverse(seg);
+      if (is_reverse_) {
+        flipVelocity(seg);
+      }
+
+      auto seg_output = calcTrajectoryVelocity(seg);
+
+      // Flip this segment's output back to its real sign immediately (rather than waiting until
+      // the very end, as the single-segment path does) since different segments may need
+      // different signs and there is no longer a single node-level is_reverse_ that applies to the
+      // whole concatenated array.
+      if (is_reverse_) {
+        flipVelocity(seg_output);
+      }
+
+      if (seg_output.empty()) {
+        continue;
+      }
+
+      if (output.empty()) {
+        output.insert(output.end(), seg_output.begin(), seg_output.end());
+      } else {
+        // Drop this segment's first point: it duplicates (or nearly duplicates, spatially) the
+        // previous segment's last point at the shared transition boundary.
+        output.insert(output.end(), seg_output.begin() + 1, seg_output.end());
+      }
+    }
+
+    current_closest_point_from_prev_output_ = saved_closest_point_from_prev_output;
+
+    output = autoware::motion_utils::removeOverlapPoints(output);
+
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *clock_, 3000,
+      "[BIDIR-DEBUG] segment-aware smoothing produced %zu output points from %zu segments",
+      output.size(), sign_runs.size());
   }
 
-  const auto output = calcTrajectoryVelocity(input_points);
   if (output.empty()) {
     RCLCPP_WARN(get_logger(), "Output Point is empty");
     return;
@@ -524,7 +636,11 @@ void VelocitySmootherNode::onCurrentTrajectory(const Trajectory::ConstSharedPtr 
 
   // for reverse velocity
   // NOTE: this process must be in the end of the process
-  if (is_reverse_) {
+  //
+  // In the segment-aware path this has already been done per-segment above (each segment's
+  // output was flipped back to its real sign before concatenation), so doing it again here would
+  // double-flip an already-correct array.
+  if (!did_segment_split && is_reverse_) {
     flipVelocity(output_resampled);
   }
 
@@ -1123,6 +1239,46 @@ bool VelocitySmootherNode::isReverse(const TrajectoryPoints & points) const
 
   return std::any_of(
     points.begin(), points.end(), [](const auto & pt) { return pt.longitudinal_velocity_mps < 0; });
+}
+
+std::vector<std::pair<size_t, size_t>> VelocitySmootherNode::splitBySignRuns(
+  const TrajectoryPoints & points) const
+{
+  constexpr double kZeroVelEps = 1e-3;
+
+  std::vector<std::pair<size_t, size_t>> runs;
+  if (points.empty()) {
+    return runs;
+  }
+
+  int current_sign = 0;  // 0 = undetermined yet (only near-zero points seen so far)
+  size_t run_start = 0;
+  for (size_t i = 0; i < points.size(); ++i) {
+    const double v = points.at(i).longitudinal_velocity_mps;
+    const int pt_sign = (v > kZeroVelEps) ? 1 : ((v < -kZeroVelEps) ? -1 : 0);
+
+    if (pt_sign == 0) {
+      // Near-zero velocity: belongs to whatever run it currently sits in, doesn't trigger a
+      // split by itself.
+      continue;
+    }
+
+    if (current_sign == 0) {
+      current_sign = pt_sign;
+      continue;
+    }
+
+    if (pt_sign != current_sign) {
+      // Sign changed: close the current run here, sharing this point (index i) as the boundary
+      // with the next run (it gets included in both).
+      runs.emplace_back(run_start, i);
+      run_start = i;
+      current_sign = pt_sign;
+    }
+  }
+  runs.emplace_back(run_start, points.size() - 1);
+
+  return runs;
 }
 void VelocitySmootherNode::flipVelocity(TrajectoryPoints & points) const
 {

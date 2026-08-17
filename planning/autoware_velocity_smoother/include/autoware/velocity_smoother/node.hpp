@@ -283,6 +283,13 @@ private:
   void flipVelocity(TrajectoryPoints & points) const;
   void publishStopWatchTime();
 
+  // Bidirectional-driving support: split a trajectory into contiguous index ranges
+  // ([start, end], inclusive) where the velocity sign is consistent. Adjacent runs share their
+  // boundary point (duplicated on both sides) so each run's smoothing gets a clean anchor point
+  // at the forward<->reverse transition. Points with near-zero velocity are folded into the
+  // current run and do not trigger a split by themselves.
+  std::vector<std::pair<size_t, size_t>> splitBySignRuns(const TrajectoryPoints & points) const;
+
   std::unique_ptr<autoware_utils_logging::LoggerLevelConfigure> logger_configure_;
   std::unique_ptr<autoware_utils_debug::PublishedTimePublisher> published_time_publisher_;
 
