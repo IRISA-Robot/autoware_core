@@ -79,8 +79,8 @@ bool StopLineModule::modifyPathVelocity(
   planning_factor_interface_->add(
     path.restore(), planner_data.current_odometry->pose, path.compute(*stop_point).point.pose,
     autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
-    autoware_internal_planning_msgs::msg::SafetyFactorArray{}, true /*is_driving_forward*/, 0.0,
-    0.0 /*shift distance*/, "stopline");
+    autoware_internal_planning_msgs::msg::SafetyFactorArray{}, planner_data.is_driving_forward,
+    0.0, 0.0 /*shift distance*/, "stopline");
 
   updateStateAndStoppedTime(clock_->now(), *stop_point - ego_s, planner_data.isVehicleStopped());
 
@@ -101,7 +101,15 @@ std::pair<double, std::optional<double>> StopLineModule::getEgoAndStopPoint(
 
   switch (state_) {
     case State::APPROACH: {
-      const double base_link2front = planner_data.vehicle_info_.max_longitudinal_offset_m;
+      // Offset from base_link to the vehicle's LEADING edge along the current
+      // direction of travel. Forward: front bumper (max_longitudinal_offset_m,
+      // positive). Reversing: the physically leading edge is the REAR bumper —
+      // min_longitudinal_offset_m is -rear_overhang_m, so negate it to get a
+      // positive "distance from base_link to leading edge" (see road_crossing's
+      // findEgoAndStopPoint() for the same idiom).
+      const double base_link2front = planner_data.is_driving_forward
+                                        ? planner_data.vehicle_info_.max_longitudinal_offset_m
+                                        : -planner_data.vehicle_info_.min_longitudinal_offset_m;
       const LineString2d stop_line = planning_utils::extendSegmentToBounds(
         lanelet::utils::to2D(stop_line_).basicLineString(), left_bound, right_bound);
 
@@ -193,7 +201,9 @@ void StopLineModule::updateStateAndStoppedTime(
 void StopLineModule::updateDebugData(
   const geometry_msgs::msg::Pose & stop_pose, const PlannerData & planner_data)
 {
-  debug_data_.base_link2front = planner_data.vehicle_info_.max_longitudinal_offset_m;
+  debug_data_.base_link2front = planner_data.is_driving_forward
+                                   ? planner_data.vehicle_info_.max_longitudinal_offset_m
+                                   : -planner_data.vehicle_info_.min_longitudinal_offset_m;
   debug_data_.stop_pose = stop_pose;
   if (state_ == State::START) {
     debug_data_.stop_pose = std::nullopt;
