@@ -328,6 +328,12 @@ void BehaviorVelocityPlannerNode::onTrigger(
     return;
   }
 
+  // Update whether the ego vehicle is currently driving forward, once per planning cycle
+  // (mirrors the non-experimental node.cpp's onTrigger() update of
+  // PlannerData::is_driving_forward).
+  planner_data_.is_driving_forward =
+    autoware::motion_utils::isDrivingForwardWithTwist(input_path_msg->points).value_or(true);
+
   const auto output_path = generatePath(
     *input_path, input_path_msg->header, input_path_msg->left_bound, input_path_msg->right_bound,
     planner_data_);
@@ -360,13 +366,15 @@ Trajectory BehaviorVelocityPlannerNode::generatePath(
   const std::vector<geometry_msgs::msg::Point> & left_bound,
   const std::vector<geometry_msgs::msg::Point> & right_bound, const PlannerData & planner_data)
 {
-  // TODO(someone): support backward path
+  // Backward paths are supported: direction-aware scene modules (e.g. walkway,
+  // detection_area, road_crossing, stop_line) handle `planner_data.is_driving_forward`
+  // themselves. Whether a backward path can reach this node at all is gated upstream by
+  // RouteHandler's `allow_reverse_route` policy (default false), not here.
   is_driving_forward_ = is_driving_forward(input_path);
   if (!is_driving_forward_) {
-    RCLCPP_WARN_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
       get_logger(), *get_clock(), logger_throttle_interval,
-      "Backward path is NOT supported, just returning input path");
-    return input_path;
+      "Driving in reverse: planning path velocity with backward-aware scene modules.");
   }
 
   // Plan path velocity
