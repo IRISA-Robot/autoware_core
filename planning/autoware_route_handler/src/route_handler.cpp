@@ -2294,25 +2294,34 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
       !hasDeferredRegulatoryElementForReverse(st_llt)) {
       const lanelet::ConstLanelet inv_llt = st_llt.invert();
 
-      // Angle check against the INVERTED start lanelet's own centerline tangent, not the forward
-      // one. Verified (not assumed) by reading lanelet2_core's ConstLanelet::centerline3d():
-      //   centerline3d() { return inverted() ? constData()->centerline().invert()
-      //                                       : constData()->centerline(); }
-      // i.e. for an inverted ConstLanelet, `.centerline()` itself already returns the
-      // point-order-reversed linestring. `get_lanelet_angle()` computes
-      // atan2(segment.back() - segment.front()) over that (already-reversed) linestring, so
-      // calling it on `inv_llt` directly yields the already-correctly-flipped (~180 deg opposite
-      // of forward) tangent angle at ego's position -- no manual +/- pi adjustment is needed or
-      // correct here.
-      const double inv_lanelet_angle = autoware::experimental::lanelet2_utils::get_lanelet_angle(
-        inv_llt,
-        autoware::experimental::lanelet2_utils::from_ros(start_checkpoint.position).basicPoint());
-      const double inv_angle_diff =
-        std::abs(autoware_utils_math::normalize_radian(inv_lanelet_angle - pose_yaw));
-      const bool inv_is_proper_angle = inv_angle_diff <= std::abs(yaw_threshold);
-
+      // Eligibility for a reverse-start candidate is "is ego's actual heading consistent with
+      // being positioned/aligned in this physical lanelet at all" -- which is exactly what
+      // `is_proper_angle` (computed above against `st_llt`'s FORWARD tangent) already answers,
+      // and this block is unreachable unless `is_proper_angle` is true (see the `continue` a few
+      // lines above that skips this entire loop body otherwise). Reversing out of a lanelet does
+      // not rotate the vehicle 180 degrees -- ego's nose still points the same physical direction
+      // it always did, it simply drives backward along the lanelet in reverse gear. So the correct
+      // check here is the SAME forward-tangent alignment already established, not a fresh
+      // alignment check against the inverted lanelet's tangent.
+      //
+      // A prior version of this code computed a separate `inv_angle_diff` by comparing pose_yaw
+      // against `get_lanelet_angle(inv_llt, ...)` -- the INVERTED centerline's tangent, which is
+      // ~180 degrees opposite the forward tangent by construction (verified by reading
+      // lanelet2_core's ConstLanelet::centerline3d(): for an inverted view, `.centerline()`
+      // already returns the point-order-reversed linestring). That is mathematically guaranteed to
+      // fail the same yaw_threshold (90 deg) test whenever the forward `is_proper_angle` passed
+      // (proof: if |angle_diff| <= 90 deg, then |normalize(angle_diff +/- 180 deg)| >= 90 deg,
+      // with equality only at the boundary) -- so on real hardware, where ego is normally driving
+      // forward with its heading aligned to the lane, the reverse-start candidate was *always*
+      // silently discarded here, regardless of whether the routing graph itself supported the
+      // reverse route. Confirmed empirically against the real production map
+      // (/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm, lanelet 1970 -> 1945): forward tangent
+      // -179.1 deg, inverted tangent -14.3 deg, diff 164.9 deg -- while
+      // getRoute(1970.invert(), 1945.invert()) itself succeeds with a 1-hop, length2d=45.4 path
+      // (versus the 88.4-length 5-hop forward loop), proving the routing graph was never the
+      // problem.
       const auto inv_optional_route = routing_graph_ptr_->getRoute(inv_llt, goal_lanelet, 0);
-      if (inv_optional_route && inv_is_proper_angle) {
+      if (inv_optional_route && is_proper_angle) {
         is_route_found = true;
 
         // Deliberately NOT wired into the getClosestPreferredLaneletWithinRoute() early-break
@@ -2329,12 +2338,12 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
         // rerouting semantics, and without ever letting a reverse-start pre-empt a valid
         // forward continuity match.
         const double inv_route_length = inv_optional_route->length2d();
-        const double inv_route_cost = inv_route_length + angle_diff_weight * inv_angle_diff;
+        const double inv_route_cost = inv_route_length + angle_diff_weight * angle_diff;
         RCLCPP_DEBUG(
           logger_,
           "Lanelet ID %ld (inverted / reverse-start): Route length = %.1f, Angle Diff = %.4f "
           "rad, Route cost = %.2f",
-          st_llt.id(), inv_route_length, inv_angle_diff, inv_route_cost);
+          st_llt.id(), inv_route_length, angle_diff, inv_route_cost);
         if (inv_route_cost < min_route_cost) {
           min_route_cost = inv_route_cost;
           shortest_path = inv_optional_route->shortestPath();
@@ -2374,16 +2383,16 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
         !hasDeferredRegulatoryElementForReverse(goal_lanelet)) {
         const lanelet::ConstLanelet inv_goal_llt = goal_lanelet.invert();
         const auto inv_goal_optional_route = routing_graph_ptr_->getRoute(inv_llt, inv_goal_llt, 0);
-        if (inv_goal_optional_route && inv_is_proper_angle) {
+        if (inv_goal_optional_route && is_proper_angle) {
           is_route_found = true;
           const double inv_goal_route_length = inv_goal_optional_route->length2d();
           const double inv_goal_route_cost =
-            inv_goal_route_length + angle_diff_weight * inv_angle_diff;
+            inv_goal_route_length + angle_diff_weight * angle_diff;
           RCLCPP_DEBUG(
             logger_,
             "Lanelet ID %ld (inverted start + inverted goal, direct reverse): Route length = "
             "%.1f, Angle Diff = %.4f rad, Route cost = %.2f",
-            st_llt.id(), inv_goal_route_length, inv_angle_diff, inv_goal_route_cost);
+            st_llt.id(), inv_goal_route_length, angle_diff, inv_goal_route_cost);
           if (inv_goal_route_cost < min_route_cost) {
             min_route_cost = inv_goal_route_cost;
             shortest_path = inv_goal_optional_route->shortestPath();
