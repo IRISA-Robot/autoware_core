@@ -126,10 +126,15 @@ std::vector<PredictedPath> resample_highest_confidence_predicted_paths(
 
 double calc_x_offset_to_bumper(const bool is_driving_forward, const VehicleInfo & vehicle_info)
 {
+  // Offset from base_link to ego's LEADING edge along the current direction of travel:
+  // forward -> front bumper (max_longitudinal_offset_m, positive); reversing -> the physically
+  // leading edge is the REAR bumper, and min_longitudinal_offset_m is -rear_overhang_m, so negate
+  // it to get a positive "distance from base_link to leading edge" (same idiom as
+  // calc_distance_to_front_object / road_crossing / walkway / stop_line's fixes).
   if (is_driving_forward) {
     return vehicle_info.max_longitudinal_offset_m;
   }
-  return vehicle_info.min_longitudinal_offset_m;
+  return -vehicle_info.min_longitudinal_offset_m;
 }
 
 Float64Stamped create_float64_stamped(const rclcpp::Time & now, const float & data)
