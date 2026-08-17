@@ -357,19 +357,16 @@ autoware_planning_msgs::msg::Path BehaviorVelocityPlannerNode::generatePath(
 {
   autoware_planning_msgs::msg::Path output_path_msg;
 
-  // TODO(someone): support backward path
+  // Backward paths are supported: direction-aware scene modules (e.g. walkway,
+  // detection_area, road_crossing, stop_line) handle `planner_data.is_driving_forward`
+  // themselves. Whether a backward path can reach this node at all is gated upstream by
+  // RouteHandler's `allow_reverse_route` policy (default false), not here.
   const auto is_driving_forward = autoware::motion_utils::isDrivingForward(input_path_msg->points);
   is_driving_forward_ = is_driving_forward ? is_driving_forward.value() : is_driving_forward_;
   if (!is_driving_forward_) {
-    RCLCPP_WARN_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
       get_logger(), *get_clock(), logger_throttle_interval,
-      "Backward path is NOT supported. just converting path_with_lane_id to path");
-    output_path_msg = to_path(*input_path_msg);
-    output_path_msg.header.frame_id = "map";
-    output_path_msg.header.stamp = input_path_msg->header.stamp;
-    output_path_msg.left_bound = input_path_msg->left_bound;
-    output_path_msg.right_bound = input_path_msg->right_bound;
-    return output_path_msg;
+      "Driving in reverse: planning path velocity with backward-aware scene modules.");
   }
 
   // Plan path velocity
