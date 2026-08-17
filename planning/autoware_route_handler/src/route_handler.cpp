@@ -305,6 +305,16 @@ bool RouteHandler::isHandlerReady() const
 
 void RouteHandler::setRouteLanelets(const lanelet::ConstLanelets & path_lanelets)
 {
+  // Bidirectional-driving support: path_lanelets is the one place in this function where the
+  // traversed ConstLanelet objects still carry their correct .inverted() bit (they come straight
+  // out of planPathLaneletsBetweenCheckpoints()'s routing-graph search). Every other lanelet
+  // touched below is re-fetched by id from lanelet_map_ptr_ (always the forward view), so record
+  // the per-id direction here before that happens.
+  reversed_in_route_.clear();
+  for (const auto & lane : path_lanelets) {
+    reversed_in_route_[lane.id()] = lane.inverted();
+  }
+
   if (!path_lanelets.empty()) {
     const auto & first_lanelet = path_lanelets.front();
     start_lanelets_ = lanelet::utils::query::getAllNeighbors(routing_graph_ptr_, first_lanelet);
@@ -401,7 +411,17 @@ void RouteHandler::setRouteLanelets(const lanelet::ConstLanelets & path_lanelets
   rtree_nodes.reserve(route_lanelets_id.size());
   size_t i = 0;
   for (const auto & id : route_lanelets_id) {
-    route_lanelets_.push_back(lanelet_map_ptr_->laneletLayer.get(id));
+    // Re-apply the tracked direction (if any) when re-fetching by id -- laneletLayer.get()
+    // always yields the forward view, which would otherwise silently discard reversed_in_route_
+    // recorded above for the primary path_lanelets ids. Ids added purely as lane-change
+    // candidates (right/left relations, not in path_lanelets) default to forward, which is
+    // correct since lane_change is not exercised on reversed segments.
+    const lanelet::ConstLanelet forward_llt = lanelet_map_ptr_->laneletLayer.get(id);
+    const auto reversed_it = reversed_in_route_.find(id);
+    const lanelet::ConstLanelet llt =
+      (reversed_it != reversed_in_route_.end() && reversed_it->second) ? forward_llt.invert()
+                                                                        : forward_llt;
+    route_lanelets_.push_back(llt);
     rtree_nodes.emplace_back(
       boost::geometry::return_envelope<autoware_utils_geometry::Box2d>(
         route_lanelets_.back().polygon2d().basicPolygon()),
@@ -418,8 +438,65 @@ void RouteHandler::clearRoute()
   preferred_lanelets_.clear();
   start_lanelets_.clear();
   goal_lanelets_.clear();
+  reversed_in_route_.clear();
   route_ptr_ = nullptr;
   is_handler_ready_ = false;
+}
+
+void RouteHandler::setAllowReverseRoute(bool allow)
+{
+  allow_reverse_route_ = allow;
+}
+
+bool RouteHandler::isLaneletInvertedInRoute(const lanelet::ConstLanelet & lanelet) const
+{
+  const auto it = reversed_in_route_.find(lanelet.id());
+  if (it != reversed_in_route_.end()) {
+    return it->second;
+  }
+  // Not tracked (e.g. queried before any route is set, or for a lanelet outside the route) --
+  // fall back to trusting the caller-provided ConstLanelet's own orientation.
+  return lanelet.inverted();
+}
+
+bool RouteHandler::isBidirectionalDrivingLanelet(const lanelet::ConstLanelet & llt)
+{
+  // Idiom follows the existing custom-tag convention in this file, see isNoDrivableLane()
+  // (attributeOr("no_drivable_lane", "no")).
+  return llt.attributeOr("bidirectional_driving", "no") == "yes";
+}
+
+bool RouteHandler::hasDeferredRegulatoryElementForReverse(const lanelet::ConstLanelet & llt)
+{
+  // Regulatory element types explicitly deferred by the bidirectional-driving migration -- see
+  // bidirectional_plan/06-deferred-scope.md. Checked generically via each regulatory element's
+  // "subtype" attribute so this does not require linking against every concrete regulatory
+  // element class (many of blind_spot/no_stopping_area/virtual_traffic_light/occlusion_spot are
+  // autoware_lanelet2_extension custom regulatory elements, not lanelet2-core ones).
+  static const std::unordered_set<std::string> deferred_types = {
+    "traffic_light",       "roundabout",         "crosswalk",     "blind_spot",
+    "no_stopping_area",    "virtual_traffic_light", "occlusion_spot", "speed_bump"};
+
+  for (const auto & re : llt.regulatoryElements()) {
+    if (!re) continue;
+    if (!re->hasAttribute(lanelet::AttributeName::Subtype)) continue;
+    const std::string subtype = re->attribute(lanelet::AttributeName::Subtype).value();
+    if (deferred_types.count(subtype) != 0) {
+      return true;
+    }
+  }
+
+  // "intersection" is not a regulatory element in this codebase's maps -- it is expressed as a
+  // RightOfWay regulatory element (already caught above if tagged with subtype "right_of_way" is
+  // NOT in the deferred list on purpose, since plain right_of_way without an intersection
+  // attribute is not itself deferred) plus lanelet-level attributes. Reject on the lanelet-level
+  // "turn_direction" attribute (set on lanelets inside a signalized/unsignalized intersection in
+  // this map authoring convention) as a conservative proxy for "this is an intersection lanelet".
+  if (llt.hasAttribute("turn_direction")) {
+    return true;
+  }
+
+  return false;
 }
 
 void RouteHandler::setLaneletsFromRouteMsg()
@@ -430,6 +507,7 @@ void RouteHandler::setLaneletsFromRouteMsg()
   route_lanelets_.clear();
   route_lanelets_rtree_.clear();
   preferred_lanelets_.clear();
+  reversed_in_route_.clear();
   const bool is_route_valid = lanelet::utils::route::isRouteValid(*route_ptr_, lanelet_map_ptr_);
   if (!is_route_valid) {
     return;
@@ -444,10 +522,18 @@ void RouteHandler::setLaneletsFromRouteMsg()
   rtree_nodes.reserve(primitive_size);
   size_t i = 0;
 
+  // Bidirectional-driving support: this is the one place a LaneletRoute message is turned back
+  // into live ConstLanelet objects, so it is where LaneletSegment::is_reversed must be read back
+  // out and re-applied via .invert() -- otherwise a route loaded from a message (as opposed to
+  // one just computed in-process by planPathLaneletsBetweenCheckpoints()) would silently lose
+  // direction. Also repopulates the reversed_in_route_ side-table so it round-trips correctly.
   for (const auto & route_section : route_ptr_->segments) {
     for (const auto & primitive : route_section.primitives) {
       const auto id = primitive.id;
-      const auto & llt = lanelet_map_ptr_->laneletLayer.get(id);
+      const lanelet::ConstLanelet forward_llt = lanelet_map_ptr_->laneletLayer.get(id);
+      const lanelet::ConstLanelet llt =
+        route_section.is_reversed ? forward_llt.invert() : forward_llt;
+      reversed_in_route_[id] = route_section.is_reversed;
       route_lanelets_.push_back(llt);
       rtree_nodes.emplace_back(
         boost::geometry::return_envelope<autoware_utils_geometry::Box2d>(
@@ -462,17 +548,19 @@ void RouteHandler::setLaneletsFromRouteMsg()
   goal_lanelets_.clear();
   start_lanelets_.clear();
   if (!route_ptr_->segments.empty()) {
-    goal_lanelets_.reserve(route_ptr_->segments.back().primitives.size());
-    for (const auto & primitive : route_ptr_->segments.back().primitives) {
+    const auto & goal_section = route_ptr_->segments.back();
+    goal_lanelets_.reserve(goal_section.primitives.size());
+    for (const auto & primitive : goal_section.primitives) {
       const auto id = primitive.id;
-      const auto & llt = lanelet_map_ptr_->laneletLayer.get(id);
-      goal_lanelets_.push_back(llt);
+      const lanelet::ConstLanelet forward_llt = lanelet_map_ptr_->laneletLayer.get(id);
+      goal_lanelets_.push_back(goal_section.is_reversed ? forward_llt.invert() : forward_llt);
     }
-    start_lanelets_.reserve(route_ptr_->segments.front().primitives.size());
-    for (const auto & primitive : route_ptr_->segments.front().primitives) {
+    const auto & start_section = route_ptr_->segments.front();
+    start_lanelets_.reserve(start_section.primitives.size());
+    for (const auto & primitive : start_section.primitives) {
       const auto id = primitive.id;
-      const auto & llt = lanelet_map_ptr_->laneletLayer.get(id);
-      start_lanelets_.push_back(llt);
+      const lanelet::ConstLanelet forward_llt = lanelet_map_ptr_->laneletLayer.get(id);
+      start_lanelets_.push_back(start_section.is_reversed ? forward_llt.invert() : forward_llt);
     }
   }
   is_handler_ready_ = true;
@@ -1796,7 +1884,12 @@ PathWithLaneId RouteHandler::getCenterLinePath(
   // append a point only when having one point so that yaw calculation would work
   if (reference_path.points.size() == 1) {
     const lanelet::Id lane_id = reference_path.points.front().lane_ids.front();
-    const auto lanelet = lanelet_map_ptr_->laneletLayer.get(lane_id);
+    const lanelet::ConstLanelet forward_lanelet = lanelet_map_ptr_->laneletLayer.get(lane_id);
+    // Bidirectional-driving support: laneletLayer.get() always returns the forward view, so
+    // re-apply the tracked direction before computing yaw, otherwise the synthesized point below
+    // would point the wrong way on a reversed segment.
+    const lanelet::ConstLanelet lanelet =
+      isLaneletInvertedInRoute(forward_lanelet) ? forward_lanelet.invert() : forward_lanelet;
     const auto point = reference_path.points.front().point.pose.position;
     const auto lane_yaw = autoware::experimental::lanelet2_utils::get_lanelet_angle(
       lanelet, autoware::experimental::lanelet2_utils::from_ros(point).basicPoint());
@@ -2196,6 +2289,57 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
     for (const auto & llt : path) {
       path_lanelets->push_back(llt);
     }
+
+    // Bidirectional-driving policy gate (see bidirectional_plan/04-routing-foundation.md §4b).
+    // lanelet2's own RoutingGraph::build() already adds edges for both orientations of any
+    // one_way=no lanelet (verified in autoware_lanelet2_extension's Phase-0 spike), so the
+    // Dijkstra search above may have already returned a path traversing an inverted lanelet
+    // purely because lanelet2 allows it -- independent of Autoware's own policy. Reject (rather
+    // than silently accept) any such path unless:
+    //   1) allow_reverse_route_ is explicitly enabled, AND
+    //   2) every inverted lanelet in the path additionally carries bidirectional_driving=yes
+    //      (the narrower Autoware-only policy tag), AND
+    //   3) no inverted lanelet in the path carries a regulatory element type this migration
+    //      explicitly defers (traffic_light, intersection, roundabout, crosswalk, blind_spot,
+    //      no_stopping_area, virtual_traffic_light, occlusion_spot, speed_bump).
+    // This is a post-hoc check on the winning path rather than a routing-cost-graph rebuild per
+    // call: simpler, and acceptable given allow_reverse_route_ defaults to false and this is a
+    // new opt-in capability -- the tradeoff is that a valid, entirely-forward alternate route
+    // could theoretically be rejected in favor of "no route found" if the (rejected) shortest
+    // path happens to dip into a disallowed inverted lanelet. Flagged for follow-up if this
+    // proves too conservative in practice.
+    for (const auto & llt : *path_lanelets) {
+      if (!llt.inverted()) {
+        continue;
+      }
+      if (!allow_reverse_route_) {
+        RCLCPP_WARN(
+          logger_,
+          "planPathLaneletsBetweenCheckpoints: rejecting path -- traverses inverted lanelet %ld "
+          "but allow_reverse_route is false",
+          llt.id());
+        path_lanelets->clear();
+        return false;
+      }
+      if (!isBidirectionalDrivingLanelet(llt)) {
+        RCLCPP_WARN(
+          logger_,
+          "planPathLaneletsBetweenCheckpoints: rejecting path -- inverted lanelet %ld is not "
+          "tagged bidirectional_driving=yes",
+          llt.id());
+        path_lanelets->clear();
+        return false;
+      }
+      if (hasDeferredRegulatoryElementForReverse(llt)) {
+        RCLCPP_WARN(
+          logger_,
+          "planPathLaneletsBetweenCheckpoints: rejecting path -- inverted lanelet %ld carries a "
+          "regulatory element type deferred for reverse routing",
+          llt.id());
+        path_lanelets->clear();
+        return false;
+      }
+    }
   } else {
     RCLCPP_ERROR_STREAM(
       logger_, "Failed to find a proper route!"
@@ -2225,6 +2369,13 @@ std::vector<LaneletSegment> RouteHandler::createMapSegments(
     LaneletSegment route_section_msg;
     const lanelet::ConstLanelets route_section_lanelets = getNeighborsWithinRoute(main_llt);
     route_section_msg.preferred_primitive.id = main_llt.id();
+    // Bidirectional-driving support: this is the narrowest, most load-bearing spot in the
+    // conversion from RouteHandler's lanelet::ConstLanelets sequence to LaneletSegment[] -- the
+    // .inverted() bit on main_llt (sourced from route_lanelets_, already direction-corrected by
+    // setRouteLanelets()) must be read off here before it is otherwise lost once this message is
+    // serialized. is_reversed is a segment-level field (not per LaneletPrimitive): a reversed
+    // segment is a single-lane reverse corridor and does not offer lane-change alternatives.
+    route_section_msg.is_reversed = main_llt.inverted();
     route_section_msg.primitives.reserve(route_section_lanelets.size());
     for (const auto & section_llt : route_section_lanelets) {
       LaneletPrimitive p;

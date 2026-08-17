@@ -40,6 +40,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,6 +89,14 @@ public:
   void setRouteLanelets(const lanelet::ConstLanelets & path_lanelets);
   void clearRoute();
 
+  // Bidirectional-driving support (see bidirectional_plan/04-routing-foundation.md).
+  // Gates whether planPathLaneletsBetweenCheckpoints() is allowed to return a path that
+  // traverses an inverted (reverse-direction) lanelet at all. Defaults to false so existing
+  // deployments are unaffected until explicitly opted in (e.g. via a ROS param the mission
+  // planner node reads at startup). See allow_reverse_route param note in the route handler's
+  // README / mission planner wiring.
+  void setAllowReverseRoute(bool allow);
+
   // const methods
 
   // for route handler status
@@ -103,6 +113,33 @@ public:
   std::shared_ptr<const lanelet::routing::RoutingGraphContainer> getOverallGraphPtr() const;
   lanelet::LaneletMapPtr getLaneletMapPtr() const;
   static bool isNoDrivableLane(const lanelet::ConstLanelet & llt);
+
+  /**
+   * @brief Whether the given lanelet is currently tracked as traversed in the inverted
+   * (reverse) direction within the active route. Looks up the direction side-table populated
+   * by setRoute()/setRouteLanelets(); falls back to the passed lanelet's own
+   * ConstLanelet::inverted() bit if the id is not tracked (e.g. queried before any route is
+   * set), so this is safe to call defensively.
+   */
+  bool isLaneletInvertedInRoute(const lanelet::ConstLanelet & lanelet) const;
+
+  /**
+   * @brief Autoware-only policy gate (separate from lanelet2's own one_way tag): only lanelets
+   * explicitly tagged bidirectional_driving=yes are valid reverse-route candidates, even though
+   * lanelet2's routing graph will happily invert any one_way=no lanelet. See
+   * bidirectional_plan/04-routing-foundation.md §4a.
+   */
+  static bool isBidirectionalDrivingLanelet(const lanelet::ConstLanelet & llt);
+
+  /**
+   * @brief Reject-gate for regulatory element types explicitly deferred by the bidirectional-
+   * driving migration (see bidirectional_plan/06-deferred-scope.md): traffic_light,
+   * intersection, roundabout, crosswalk, blind_spot, no_stopping_area, virtual_traffic_light,
+   * occlusion_spot, speed_bump. Returns true if the lanelet carries a regulatory element (or,
+   * for intersection/roundabout, a lanelet-level attribute) matching one of those types, in
+   * which case it must not be selected as an inverted route segment.
+   */
+  static bool hasDeferredRegulatoryElementForReverse(const lanelet::ConstLanelet & llt);
 
   // for routing
   bool planPathLaneletsBetweenCheckpoints(
@@ -360,6 +397,18 @@ private:
   lanelet::ConstLanelets start_lanelets_;
   lanelet::ConstLanelets goal_lanelets_;
   std::shared_ptr<LaneletRoute> route_ptr_{nullptr};
+
+  // Direction side-table (bidirectional-driving support): lanelet::Id -> "traversed inverted in
+  // the current route" bool. Populated by setLaneletsFromRouteMsg()/setRouteLanelets() from the
+  // ConstLanelet::inverted() bit (or LaneletSegment::is_reversed on message round-trip) at the
+  // one place those bits are still attached to a live ConstLanelet, since re-fetching a lanelet
+  // by id from lanelet_map_ptr_->laneletLayer.get() elsewhere in this file always yields the
+  // forward view. See bidirectional_plan/04-routing-foundation.md §4b.
+  std::unordered_map<lanelet::Id, bool> reversed_in_route_;
+
+  // Gates whether planPathLaneletsBetweenCheckpoints() may return a path containing an inverted
+  // lanelet at all. Defaults to false (backward compatible). Consumed via setAllowReverseRoute().
+  bool allow_reverse_route_{false};
 
   rclcpp::Logger logger_{rclcpp::get_logger("route_handler")};
 
