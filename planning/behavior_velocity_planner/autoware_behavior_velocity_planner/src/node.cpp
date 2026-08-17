@@ -330,6 +330,12 @@ void BehaviorVelocityPlannerNode::onTrigger(
     return;
   }
 
+  // Update whether the ego vehicle is currently driving forward, once per planning cycle
+  // (mirrors motion_velocity_planner's node.cpp update of
+  // motion_velocity_planner_common::PlannerData::is_driving_forward).
+  planner_data_.is_driving_forward =
+    autoware::motion_utils::isDrivingForwardWithTwist(input_path_msg->points).value_or(true);
+
   const autoware_planning_msgs::msg::Path output_path_msg =
     generatePath(input_path_msg, planner_data_);
 

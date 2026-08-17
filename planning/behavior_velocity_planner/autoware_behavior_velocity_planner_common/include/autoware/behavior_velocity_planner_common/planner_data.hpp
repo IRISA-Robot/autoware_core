@@ -66,6 +66,11 @@ struct PlannerData
 
   bool is_simulation = false;
 
+  // Whether the ego vehicle is currently driving forward along the path, updated once per
+  // planning cycle via autoware::motion_utils::isDrivingForwardWithTwist() (mirrors
+  // motion_velocity_planner_common::PlannerData::is_driving_forward). Defaults to true.
+  bool is_driving_forward = true;
+
   bool planning_factor_console_output_enabled = false;
   int planning_factor_console_output_duration = 0;
 
