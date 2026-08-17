@@ -47,12 +47,15 @@ geometry_msgs::msg::Point to_geometry_point(const pcl::PointXYZ & point);
 geometry_msgs::msg::Point to_geometry_point(const autoware_utils_geometry::Point2d & point);
 
 /**
- * @brief compute the distance between `ego_idx` and `object_pos` along `traj_points`, only when
- * ego_idx is behind of `obstacle_pos`
+ * @brief compute the distance from the leading edge of ego (front bumper when driving forward,
+ * rear bumper when reversing) at `ego_idx` to `obstacle_pos` along `traj_points`, only when
+ * `obstacle_pos` is in ego's current direction of travel (as given by `is_driving_forward`)
+ * relative to `ego_idx`
  */
 std::optional<double> calc_distance_to_front_object(
   const std::vector<TrajectoryPoint> & traj_points, const size_t ego_idx,
-  const geometry_msgs::msg::Point & obstacle_pos);
+  const geometry_msgs::msg::Point & obstacle_pos, const VehicleInfo & vehicle_info,
+  const bool is_driving_forward);
 
 template <class T>
 std::vector<T> concat_vectors(std::vector<T> first_vector, std::vector<T> second_vector)

@@ -130,13 +130,37 @@ geometry_msgs::msg::Point to_geometry_point(const autoware_utils_geometry::Point
 
 std::optional<double> calc_distance_to_front_object(
   const std::vector<TrajectoryPoint> & traj_points, const size_t ego_idx,
-  const geometry_msgs::msg::Point & obstacle_pos)
+  const geometry_msgs::msg::Point & obstacle_pos, const VehicleInfo & vehicle_info,
+  const bool is_driving_forward)
 {
   const size_t obstacle_idx = autoware::motion_utils::findNearestIndex(traj_points, obstacle_pos);
+  // `calcSignedArcLength` is anchored to the trajectory's own fixed point
+  // ordering (e.g. lane-centerline order), NOT to ego's current direction of
+  // travel: a positive result only means "obstacle_idx is at a higher index
+  // than ego_idx", which is "ahead of ego" when driving forward but "behind
+  // ego" when reversing (ego is then moving toward decreasing index) -- same
+  // class of bug as road_crossing's raw lanelet-centerline front()/back()
+  // fix. Flip the sign when reversing so the result is always positive when
+  // the obstacle is in ego's actual direction of travel.
   const auto ego_to_obstacle_distance =
     autoware::motion_utils::calcSignedArcLength(traj_points, ego_idx, obstacle_idx);
-  if (ego_to_obstacle_distance < 0.0) return std::nullopt;
-  return ego_to_obstacle_distance;
+  const double directional_ego_to_obstacle_distance =
+    is_driving_forward ? ego_to_obstacle_distance : -ego_to_obstacle_distance;
+
+  // Offset from base_link to ego's LEADING edge along the current direction
+  // of travel: forward -> front bumper (max_longitudinal_offset_m,
+  // positive); reversing -> the physically leading edge is the REAR
+  // bumper, and min_longitudinal_offset_m is -rear_overhang_m, so negate it
+  // to get a positive "distance from base_link to leading edge" (same
+  // idiom as road_crossing / walkway / stop_line's fixes).
+  const double ego_to_bumper_offset = is_driving_forward
+                                         ? vehicle_info.max_longitudinal_offset_m
+                                         : -vehicle_info.min_longitudinal_offset_m;
+
+  const double distance_to_front_object =
+    directional_ego_to_obstacle_distance - ego_to_bumper_offset;
+  if (distance_to_front_object < 0.0) return std::nullopt;
+  return distance_to_front_object;
 }
 
 std::vector<uint8_t> get_target_object_type(rclcpp::Node & node, const std::string & param_prefix)
