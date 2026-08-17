@@ -2273,6 +2273,125 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
       shortest_path = optional_route->shortestPath();
       start_lanelet = st_llt;
     }
+
+    // Also consider the *inverted* (reverse-departing) orientation of this same start lanelet.
+    // `getRoadLaneletsAtPose()` only ever returns forward-oriented ConstLanelets, and
+    // `routing_graph_ptr_->getRoute(from, to, ...)` only searches the routing graph reachable
+    // from exactly the orientation of `from` that is passed in -- it does not implicitly also try
+    // the inverted view. So without this block, a route that begins with ego backing straight out
+    // of its current lanelet is never even generated as a search candidate, regardless of what the
+    // routing graph itself supports (see bidirectional_plan/04-routing-foundation.md §4b and the
+    // post-hoc reject-gate below, which can only ever fire on inverted lanelets discovered further
+    // along a path -- never on the very first lanelet -- until this block exists).
+    //
+    // Gated identically to the post-hoc reject-gate below (allow_reverse_route_ /
+    // isBidirectionalDrivingLanelet / !hasDeferredRegulatoryElementForReverse) so we don't spend a
+    // getRoute() call on a start orientation that would just be rejected afterward anyway, and so
+    // this seeding step stays policy-consistent with the gate that already governs mid-path
+    // inversions.
+    if (
+      allow_reverse_route_ && isBidirectionalDrivingLanelet(st_llt) &&
+      !hasDeferredRegulatoryElementForReverse(st_llt)) {
+      const lanelet::ConstLanelet inv_llt = st_llt.invert();
+
+      // Angle check against the INVERTED start lanelet's own centerline tangent, not the forward
+      // one. Verified (not assumed) by reading lanelet2_core's ConstLanelet::centerline3d():
+      //   centerline3d() { return inverted() ? constData()->centerline().invert()
+      //                                       : constData()->centerline(); }
+      // i.e. for an inverted ConstLanelet, `.centerline()` itself already returns the
+      // point-order-reversed linestring. `get_lanelet_angle()` computes
+      // atan2(segment.back() - segment.front()) over that (already-reversed) linestring, so
+      // calling it on `inv_llt` directly yields the already-correctly-flipped (~180 deg opposite
+      // of forward) tangent angle at ego's position -- no manual +/- pi adjustment is needed or
+      // correct here.
+      const double inv_lanelet_angle = autoware::experimental::lanelet2_utils::get_lanelet_angle(
+        inv_llt,
+        autoware::experimental::lanelet2_utils::from_ros(start_checkpoint.position).basicPoint());
+      const double inv_angle_diff =
+        std::abs(autoware_utils_math::normalize_radian(inv_lanelet_angle - pose_yaw));
+      const bool inv_is_proper_angle = inv_angle_diff <= std::abs(yaw_threshold);
+
+      const auto inv_optional_route = routing_graph_ptr_->getRoute(inv_llt, goal_lanelet, 0);
+      if (inv_optional_route && inv_is_proper_angle) {
+        is_route_found = true;
+
+        // Deliberately NOT wired into the getClosestPreferredLaneletWithinRoute() early-break
+        // fast path above (the `if (st_llt.id() == preferred_lane.id())` block). That fast path
+        // exists purely to keep re-routes on the same lanelet as a previous route for continuity,
+        // and it matches on lanelet id only -- which is direction-agnostic, so `inv_llt` would
+        // trivially satisfy it any time the forward `st_llt` already did. But the forward
+        // candidate is evaluated first in this same loop iteration and would already have taken
+        // that early break in that case, so this branch is only ever reached when the forward
+        // candidate did NOT take the fast path (either it didn't match the preferred lanelet, or
+        // no preferred lanelet / no route was found for it). Falling through to plain cost
+        // comparison here is the correct choice: it lets a genuinely-better reverse-start win on
+        // merit without silently reusing a continuity shortcut that was designed for forward-only
+        // rerouting semantics, and without ever letting a reverse-start pre-empt a valid
+        // forward continuity match.
+        const double inv_route_length = inv_optional_route->length2d();
+        const double inv_route_cost = inv_route_length + angle_diff_weight * inv_angle_diff;
+        RCLCPP_DEBUG(
+          logger_,
+          "Lanelet ID %ld (inverted / reverse-start): Route length = %.1f, Angle Diff = %.4f "
+          "rad, Route cost = %.2f",
+          st_llt.id(), inv_route_length, inv_angle_diff, inv_route_cost);
+        if (inv_route_cost < min_route_cost) {
+          min_route_cost = inv_route_cost;
+          shortest_path = inv_optional_route->shortestPath();
+          start_lanelet = inv_llt;
+        }
+      }
+
+      // IMPORTANT, discovered by empirical trace (not in the original task spec -- see report):
+      // `routing_graph_ptr_->getRoute(from, to, ...)` requires an *exact* vertex match on `to` as
+      // well as `from` -- lanelet2 treats a forward lanelet and its inverted counterpart as two
+      // distinct graph vertices (confirmed by reading ConstLanelet::operator==, which compares
+      // both constData() AND inverted()). `goal_lanelet` above is always the forward-oriented
+      // ConstLanelet returned by `getClosestLanelet()` (map storage only ever holds the forward
+      // primitive). For the direct "reverse straight out of the current lanelet into the
+      // immediately-preceding lanelet" case -- i.e. exactly the failure this task exists to fix --
+      // ego arrives at the goal traveling in the *inverted* orientation of the goal lanelet, not
+      // the forward one. A minimal manual trace (ring of 4 lanelets A-B-C-D-A, all one_way=no +
+      // bidirectional_driving=yes, ego mid-B, goal in A) confirms this concretely:
+      //   getRoute(B.invert(), A)          -> NOT FOUND (0 results)
+      //   getRoute(B.invert(), A.invert()) -> FOUND: [B.invert(), A.invert()]  (the direct 1-hop
+      //                                        reverse route the user actually wants)
+      // So `getRoute(st_llt.invert(), goal_lanelet, 0)` alone (the literal candidate described in
+      // this task's instructions) is NOT sufficient to fix the reported bug in the simple/direct
+      // case -- it would only ever succeed if the search happens to loop back around to a forward-
+      // oriented vertex, which is generally impossible for a direct one-lanelet reversal and is not
+      // what the user's failure requires. Adding this second candidate -- same inverted start,
+      // *also* inverted goal -- is necessary for this fix to actually do anything for the reported
+      // scenario. It is safe to add: it goes through the exact same cost-comparison logic as every
+      // other candidate in this loop, and the post-hoc reject-gate below already independently
+      // validates any inverted lanelet appearing anywhere in the winning path -- including the
+      // final (goal) lanelet -- via isBidirectionalDrivingLanelet()/hasDeferredRegulatoryElement-
+      // ForReverse(), so no separate eligibility pre-check on goal_lanelet is required for
+      // correctness (only skipped here as a minor optimization, mirroring the start-side gate,
+      // to avoid a doomed getRoute() call).
+      if (
+        isBidirectionalDrivingLanelet(goal_lanelet) &&
+        !hasDeferredRegulatoryElementForReverse(goal_lanelet)) {
+        const lanelet::ConstLanelet inv_goal_llt = goal_lanelet.invert();
+        const auto inv_goal_optional_route = routing_graph_ptr_->getRoute(inv_llt, inv_goal_llt, 0);
+        if (inv_goal_optional_route && inv_is_proper_angle) {
+          is_route_found = true;
+          const double inv_goal_route_length = inv_goal_optional_route->length2d();
+          const double inv_goal_route_cost =
+            inv_goal_route_length + angle_diff_weight * inv_angle_diff;
+          RCLCPP_DEBUG(
+            logger_,
+            "Lanelet ID %ld (inverted start + inverted goal, direct reverse): Route length = "
+            "%.1f, Angle Diff = %.4f rad, Route cost = %.2f",
+            st_llt.id(), inv_goal_route_length, inv_angle_diff, inv_goal_route_cost);
+          if (inv_goal_route_cost < min_route_cost) {
+            min_route_cost = inv_goal_route_cost;
+            shortest_path = inv_goal_optional_route->shortestPath();
+            start_lanelet = inv_llt;
+          }
+        }
+      }
+    }
   }
 
   if (is_route_found) {
