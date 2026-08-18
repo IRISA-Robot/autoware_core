@@ -1953,10 +1953,14 @@ PathWithLaneId RouteHandler::getCenterLinePath(
         autoware_utils_geometry::calc_distance2d(ref_point.point, next_ref_point.point);
 
       if (s < s_start && s + distance > s_start) {
-        const auto p_opt = getGeometryPointFrom2DArcLength(lanelet_sequence, s_start);
-        if (p_opt.has_value()) {
-          const auto p = use_exact ? p_opt.value() : ref_point.point;
-          add_path_point(p, lanelet, speed_limit);
+        if (distance > 1e-6) {
+          const double ratio = (s_start - s) / distance;
+          geometry_msgs::msg::Point p{};
+          p.x = ref_point.point.x * (1 - ratio) + next_ref_point.point.x * ratio;
+          p.y = ref_point.point.y * (1 - ratio) + next_ref_point.point.y * ratio;
+          p.z = ref_point.point.z * (1 - ratio) + next_ref_point.point.z * ratio;
+          const auto p_final = use_exact ? p : ref_point.point;
+          add_path_point(p_final, lanelet, speed_limit);
         } else {
           add_path_point(ref_point.point, lanelet, speed_limit);
         }
@@ -1965,10 +1969,14 @@ PathWithLaneId RouteHandler::getCenterLinePath(
         add_path_point(ref_point.point, lanelet, speed_limit);
       }
       if (s < s_end && s + distance > s_end) {
-        const auto p_opt = getGeometryPointFrom2DArcLength(lanelet_sequence, s_end);
-        if (p_opt.has_value()) {
-          const auto p = use_exact ? p_opt.value() : ref_point.point;
-          add_path_point(p, lanelet, speed_limit);
+        if (distance > 1e-6) {
+          const double ratio = (s_end - s) / distance;
+          geometry_msgs::msg::Point p{};
+          p.x = ref_point.point.x * (1 - ratio) + next_ref_point.point.x * ratio;
+          p.y = ref_point.point.y * (1 - ratio) + next_ref_point.point.y * ratio;
+          p.z = ref_point.point.z * (1 - ratio) + next_ref_point.point.z * ratio;
+          const auto p_final = use_exact ? p : ref_point.point;
+          add_path_point(p_final, lanelet, speed_limit);
         } else {
           add_path_point(ref_point.point, lanelet, speed_limit);
         }
