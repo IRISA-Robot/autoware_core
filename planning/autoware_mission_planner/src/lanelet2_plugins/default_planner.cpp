@@ -313,6 +313,15 @@ bool DefaultPlanner::is_goal_valid(const geometry_msgs::msg::Pose & goal)
     if (std::abs(angle_diff) < th_angle) {
       return true;
     }
+
+    // `bidirectional_driving` lanelets legitimately support a goal facing either direction; only
+    // checking the forward lane_yaw was rejecting valid reverse-facing final approaches.
+    if (route_handler::RouteHandler::isBidirectionalDrivingLanelet(closest_lanelet_to_goal)) {
+      const auto reverse_angle_diff = autoware_utils::normalize_radian(lane_yaw + M_PI - goal_yaw);
+      if (std::abs(reverse_angle_diff) < th_angle) {
+        return true;
+      }
+    }
   }
 
   // check if goal is in parking space
