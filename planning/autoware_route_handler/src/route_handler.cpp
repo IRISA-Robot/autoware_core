@@ -448,6 +448,11 @@ void RouteHandler::setAllowReverseRoute(bool allow)
   allow_reverse_route_ = allow;
 }
 
+void RouteHandler::setPreferLateralRatioBlendDistance(const double blend_distance_m)
+{
+  prefer_lateral_ratio_blend_distance_m_ = blend_distance_m;
+}
+
 bool RouteHandler::isLaneletInvertedInRoute(const lanelet::ConstLanelet & lanelet) const
 {
   const auto it = reversed_in_route_.find(lanelet.id());
@@ -475,6 +480,24 @@ bool RouteHandler::isBidirectionalDrivingLanelet(const lanelet::ConstLanelet & l
   const std::string bidirectional_driving_attribute =
     llt.attributeOr("bidirectional_driving", "no");
   return bidirectional_driving_attribute == "yes";
+}
+
+double RouteHandler::getPreferLateralRatio(const lanelet::ConstLanelet & llt)
+{
+  const double ratio_fwd = std::clamp(llt.attributeOr("prefer_lateral_ratio", 0.0), -1.0, 1.0);
+  if (!llt.inverted()) {
+    return ratio_fwd;
+  }
+  // Reverse traversal of the same physical lane: ConstLanelet::leftBound()/rightBound() already
+  // swap + reverse point order when inverted() (lanelet2_core primitives/Lanelet.h:164-175), so
+  // getCenterlineWithRatioProfile's vec_right_2_left naturally points the opposite physical
+  // direction here. Feeding the SAME numeric ratio (no extra negation) therefore already
+  // produces a mirrored physical bias for free -- do NOT negate again here, that would cancel
+  // the natural geometric flip and incorrectly keep the same physical side in both directions
+  // (confirmed wrong via live user testing). A map author can still override this default by
+  // explicitly writing prefer_lateral_ratio_reverse for asymmetric forward/reverse bias.
+  const double ratio_rev = llt.attributeOr("prefer_lateral_ratio_reverse", ratio_fwd);
+  return std::clamp(ratio_rev, -1.0, 1.0);
 }
 
 bool RouteHandler::hasDeferredRegulatoryElementForReverse(const lanelet::ConstLanelet & llt)
@@ -1786,11 +1809,47 @@ PathWithLaneId RouteHandler::getCenterLinePath(
   using lanelet::utils::to2D;
   using lanelet::utils::conversion::toLaneletPoint;
 
-  // 1. calculate reference points by lanelets' centerline
+  // 1. calculate reference points by lanelets' centerline, biased by each lanelet's
+  // prefer_lateral_ratio tag (if any), smoothly blended at lanelet boundaries.
   // NOTE: This vector aligns the vector lanelet_sequence.
   std::vector<PiecewiseReferencePoints> piecewise_ref_points_vec;
-  for (const auto & llt : lanelet_sequence) {
-    const lanelet::ConstLineString3d centerline = llt.centerline();
+  for (size_t i = 0; i < lanelet_sequence.size(); ++i) {
+    const auto & llt = lanelet_sequence.at(i);
+
+    const double r_i = getPreferLateralRatio(llt);
+    const double r_prev = (i == 0) ? r_i : getPreferLateralRatio(lanelet_sequence.at(i - 1));
+    const double r_next =
+      (i + 1 == lanelet_sequence.size()) ? r_i : getPreferLateralRatio(lanelet_sequence.at(i + 1));
+
+    const double llt_length = static_cast<double>(lanelet::geometry::length(llt.centerline()));
+    const double blend = prefer_lateral_ratio_blend_distance_m_;
+
+    std::function<double(double)> ratio_at_s;
+    if (llt_length < 2.0 * blend) {
+      // Short-lanelet guard: no room for a flat plateau, ramp across the whole lanelet.
+      ratio_at_s = [r_prev, r_next, llt_length](const double s) -> double {
+        if (llt_length <= 0.0) {
+          return r_next;
+        }
+        const double t = std::clamp(s / llt_length, 0.0, 1.0);
+        return r_prev + (r_next - r_prev) * t;
+      };
+    } else {
+      ratio_at_s = [r_prev, r_i, r_next, llt_length, blend](const double s) -> double {
+        if (s <= blend) {
+          const double t = (blend > 0.0) ? std::clamp(s / blend, 0.0, 1.0) : 1.0;
+          return r_prev + (r_i - r_prev) * t;
+        }
+        if (s >= llt_length - blend) {
+          const double t =
+            (blend > 0.0) ? std::clamp((s - (llt_length - blend)) / blend, 0.0, 1.0) : 1.0;
+          return r_i + (r_next - r_i) * t;
+        }
+        return r_i;
+      };
+    }
+
+    const auto centerline = lanelet::utils::getCenterlineWithRatioProfile(llt, ratio_at_s);
 
     piecewise_ref_points_vec.push_back(std::vector<ReferencePoint>{});
     for (const auto & center_point : centerline) {

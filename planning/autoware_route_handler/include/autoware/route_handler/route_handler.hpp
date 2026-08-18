@@ -97,6 +97,12 @@ public:
   // README / mission planner wiring.
   void setAllowReverseRoute(bool allow);
 
+  // prefer_lateral_ratio blending: distance (meters) over which the reference-path lateral bias
+  // ramps between two adjacent lanelets carrying different prefer_lateral_ratio values, applied
+  // at both ends of each lanelet in getCenterLinePath(). See
+  // prefer_lateral_ratio_plan/tagging-instructions.md.
+  void setPreferLateralRatioBlendDistance(const double blend_distance_m);
+
   // const methods
 
   // for route handler status
@@ -130,6 +136,21 @@ public:
    * bidirectional_plan/04-routing-foundation.md §4a.
    */
   static bool isBidirectionalDrivingLanelet(const lanelet::ConstLanelet & llt);
+
+  /**
+   * @brief Autoware-only tag: lateral bias ratio applied to the reference-path centerline for
+   * this lanelet, in the lanelet's native/authored (forward) direction. -1.0 = full left,
+   * 0.0 = centerline (default when untagged), +1.0 = full right (right-positive, matching this
+   * codebase's existing steering convention). See
+   * prefer_lateral_ratio_plan/tagging-instructions.md.
+   *
+   * On a bidirectional_driving lanelet traversed in reverse (llt.inverted() == true), the
+   * optional prefer_lateral_ratio_reverse tag is used instead, if present; otherwise this
+   * defaults to the SAME value as prefer_lateral_ratio; because the lanelet's left/right bounds
+   * are already swapped when traversed inverted, this naturally produces a mirrored physical
+   * bias (opposite physical side of the lane) without any extra sign flip needed.
+   */
+  static double getPreferLateralRatio(const lanelet::ConstLanelet & llt);
 
   /**
    * @brief Reject-gate for regulatory element types explicitly deferred by the bidirectional-
@@ -409,6 +430,10 @@ private:
   // Gates whether planPathLaneletsBetweenCheckpoints() may return a path containing an inverted
   // lanelet at all. Defaults to false (backward compatible). Consumed via setAllowReverseRoute().
   bool allow_reverse_route_{false};
+
+  // Blend distance (meters) for prefer_lateral_ratio transitions at lanelet boundaries in
+  // getCenterLinePath(). Defaults to 4.0m. Consumed via setPreferLateralRatioBlendDistance().
+  double prefer_lateral_ratio_blend_distance_m_{4.0};
 
   rclcpp::Logger logger_{rclcpp::get_logger("route_handler")};
 
