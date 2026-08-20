@@ -26,6 +26,7 @@
 #include <autoware/motion_velocity_planner_common/velocity_planning_result.hpp>
 #include <autoware/object_recognition_utils/predicted_path_utils.hpp>
 #include <autoware/objects_of_interest_marker_interface/objects_of_interest_marker_interface.hpp>
+#include <autoware/route_handler/route_handler.hpp>
 #include <autoware_utils_debug/time_keeper.hpp>
 #include <autoware_utils_system/stop_watch.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -136,7 +137,8 @@ private:
     const std::vector<TrajectoryPoint> & decimated_traj_points,
     const std::vector<std::shared_ptr<PlannerData::Object>> & objects,
     const VehicleInfo & vehicle_info, const double x_offset_to_bumper,
-    const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check);
+    const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+    const std::shared_ptr<route_handler::RouteHandler> & route_handler);
 
   /// @brief Update pointcloud_stop_candidates by the nearest collision point
   ///
@@ -153,7 +155,8 @@ private:
     const std::vector<TrajectoryPoint> & decimated_traj_points,
     const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info,
     const double x_offset_to_bumper,
-    const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check);
+    const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+    const std::shared_ptr<route_handler::RouteHandler> & route_handler);
 
   std::optional<geometry_msgs::msg::Point> plan_stop(
     const std::shared_ptr<const PlannerData> planner_data,
@@ -190,7 +193,8 @@ private:
     const std::shared_ptr<PlannerData::Object> object, const rclcpp::Time & predicted_objects_stamp,
     const double dist_from_obj_poly_to_traj_poly, const VehicleInfo & vehicle_info,
     const double x_offset_to_bumper,
-    const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check) const;
+    const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+    const std::shared_ptr<route_handler::RouteHandler> & route_handler) const;
   bool is_obstacle_velocity_requiring_fixed_stop(
     const std::shared_ptr<PlannerData::Object> object,
     const std::vector<TrajectoryPoint> & traj_points) const;

@@ -26,6 +26,12 @@
 
 #include <autoware_perception_msgs/msg/detail/shape__struct.hpp>
 
+#include <boost/geometry/algorithms/disjoint.hpp>
+
+#include <lanelet2_core/geometry/BoundingBox.h>
+#include <lanelet2_core/geometry/Polygon.h>
+#include <lanelet2_core/primitives/BoundingBox.h>
+
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -184,11 +190,38 @@ double calc_braking_dist_along_trajectory(
   return error_considered_vel * error_considered_vel * 0.5 / -braking_acc;
 }
 
+// `narrow_lane` lanelet-tag escape hatch (see the static_obstacle_avoidance module's
+// isObjectPositionInNarrowLaneLanelet(): objects positioned inside a lanelet tagged
+// `narrow_lane=yes` are excluded from in-lane avoidance shifting there, relying on this
+// module's dedicated narrow_lane_margin check instead.
+bool is_position_in_narrow_lane_lanelet(
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler,
+  const geometry_msgs::msg::Point & position)
+{
+  if (!route_handler) return false;
+  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
+  if (!lanelet_map_ptr) return false;
+
+  const lanelet::BasicPoint2d point(position.x, position.y);
+  constexpr double search_margin = 0.1;
+  const lanelet::BoundingBox2d bbox(
+    lanelet::BasicPoint2d(position.x - search_margin, position.y - search_margin),
+    lanelet::BasicPoint2d(position.x + search_margin, position.y + search_margin));
+  for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
+    if (
+      ll.attributeOr("narrow_lane", false) &&
+      !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
+      return true;
+    }
+  }
+  return false;
+}
+
 PolygonParam create_polygon_param(
   const ObstacleFilteringParam::TrimTrajectoryParam & trim_trajectory_param,
   const std::optional<double> ego_braking_distance,
   const ObstacleFilteringParam::LateralMarginParam & lateral_margin_param,
-  const std::optional<double> object_velocity)
+  const std::optional<double> object_velocity, const bool is_obstacle_in_narrow_lane = false)
 {
   PolygonParam p;
   if (!trim_trajectory_param.enable_trimming || !ego_braking_distance.has_value()) {
@@ -198,7 +231,10 @@ PolygonParam create_polygon_param(
       trim_trajectory_param.min_trajectory_length +
       trim_trajectory_param.braking_distance_scale_factor * ego_braking_distance.value();
   }
-  p.lateral_margin = lateral_margin_param.nominal_margin +
+  const double nominal_margin = is_obstacle_in_narrow_lane
+                                   ? lateral_margin_param.narrow_lane_margin
+                                   : lateral_margin_param.nominal_margin;
+  p.lateral_margin = nominal_margin +
                      (object_velocity > lateral_margin_param.is_moving_threshold_velocity
                         ? lateral_margin_param.additional_is_moving_margin
                         : lateral_margin_param.additional_is_stop_margin);
@@ -306,13 +342,13 @@ VelocityPlanningResult ObstacleStopModule::plan(
     planner_data->ego_nearest_yaw_threshold,
     rclcpp::Time(planner_data->predicted_objects_header.stamp), raw_trajectory_points,
     decimated_traj_points, planner_data->objects, planner_data->vehicle_info_, x_offset_to_bumper,
-    planner_data->trajectory_polygon_collision_check);
+    planner_data->trajectory_polygon_collision_check, planner_data->route_handler);
 
   // 4. filter obstacles of point cloud
   auto stop_obstacles_for_point_cloud = filter_stop_obstacle_for_point_cloud(
     planner_data->current_odometry, raw_trajectory_points, decimated_traj_points,
     planner_data->no_ground_pointcloud, planner_data->vehicle_info_, x_offset_to_bumper,
-    planner_data->trajectory_polygon_collision_check);
+    planner_data->trajectory_polygon_collision_check, planner_data->route_handler);
 
   // 5. concat stop obstacles by predicted objects and point cloud
   const std::vector<StopObstacle> stop_obstacles =
@@ -427,7 +463,8 @@ std::vector<StopObstacle> ObstacleStopModule::filter_stop_obstacle_for_predicted
   const std::vector<TrajectoryPoint> & decimated_traj_points,
   const std::vector<std::shared_ptr<PlannerData::Object>> & objects,
   const VehicleInfo & vehicle_info, const double x_offset_to_bumper,
-  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check)
+  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler)
 {
   autoware_utils_debug::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -485,7 +522,7 @@ std::vector<StopObstacle> ObstacleStopModule::filter_stop_obstacle_for_predicted
     const auto current_step_stop_obstacle = pick_stop_obstacle_from_predicted_object(
       odometry, traj_points, decimated_traj_points, object, predicted_objects_stamp,
       dist_from_obj_to_traj_poly, vehicle_info, x_offset_to_bumper,
-      trajectory_polygon_collision_check);
+      trajectory_polygon_collision_check, route_handler);
     if (current_step_stop_obstacle) {
       stop_obstacles.push_back(*current_step_stop_obstacle);
       continue;
@@ -565,7 +602,8 @@ std::vector<StopObstacle> ObstacleStopModule::filter_stop_obstacle_for_point_clo
   const std::vector<TrajectoryPoint> & decimated_traj_points,
   const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info,
   const double x_offset_to_bumper,
-  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check)
+  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler)
 {
   autoware_utils_debug::ScopedTimeTrack st(__func__, *time_keeper_);
   const auto & filtering_param =
@@ -588,16 +626,49 @@ std::vector<StopObstacle> ObstacleStopModule::filter_stop_obstacle_for_point_clo
   }
 
   const auto & tp = trajectory_polygon_collision_check;
-  const auto polygon_param = create_polygon_param(
+  // The collision point's position (and therefore whether it falls inside a narrow_lane
+  // lanelet) isn't known yet at this point, so build the detection polygon first using the
+  // nominal margin.
+  auto polygon_param = create_polygon_param(
     filtering_param.trim_trajectory, calc_ego_forwarding_braking_distance(traj_points, odometry),
     filtering_param.lateral_margin, std::nullopt);
-  const auto detection_polygon_with_lat_margin = get_trajectory_polygon(
-    decimated_traj_points, vehicle_info, odometry.pose.pose, polygon_param,
-    tp.enable_to_consider_current_pose, tp.time_to_convergence, tp.decimate_trajectory_step_length);
+  auto nearest_collision_point = [&]() {
+    const auto detection_polygon_with_lat_margin = get_trajectory_polygon(
+      decimated_traj_points, vehicle_info, odometry.pose.pose, polygon_param,
+      tp.enable_to_consider_current_pose, tp.time_to_convergence,
+      tp.decimate_trajectory_step_length);
+    return get_nearest_collision_point(
+      detection_polygon_with_lat_margin.traj_points, detection_polygon_with_lat_margin.polygons,
+      point_cloud, x_offset_to_bumper, vehicle_info);
+  }();
 
-  const auto nearest_collision_point = get_nearest_collision_point(
-    detection_polygon_with_lat_margin.traj_points, detection_polygon_with_lat_margin.polygons,
-    point_cloud, x_offset_to_bumper, vehicle_info);
+  // Now that the collision point is resolved, re-check against the narrow_lane lanelet tag at
+  // that position and, if needed, rebuild the polygon_param (and re-run collision detection)
+  // with the narrow_lane_margin applied instead of the nominal margin.
+  if (nearest_collision_point) {
+    const bool is_obstacle_in_narrow_lane =
+      is_position_in_narrow_lane_lanelet(route_handler, nearest_collision_point->point);
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000, "[NARROW-DEBUG] pointcloud is_obstacle_in_narrow_lane=%d",
+      is_obstacle_in_narrow_lane);
+    if (is_obstacle_in_narrow_lane) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 1000,
+        "[Stop] pointcloud obstacle in narrow_lane lanelet: applying margin %2.2f",
+        filtering_param.lateral_margin.narrow_lane_margin);
+      polygon_param = create_polygon_param(
+        filtering_param.trim_trajectory, calc_ego_forwarding_braking_distance(traj_points, odometry),
+        filtering_param.lateral_margin, std::nullopt, is_obstacle_in_narrow_lane);
+      const auto detection_polygon_with_narrow_lane_margin = get_trajectory_polygon(
+        decimated_traj_points, vehicle_info, odometry.pose.pose, polygon_param,
+        tp.enable_to_consider_current_pose, tp.time_to_convergence,
+        tp.decimate_trajectory_step_length);
+      nearest_collision_point = get_nearest_collision_point(
+        detection_polygon_with_narrow_lane_margin.traj_points,
+        detection_polygon_with_narrow_lane_margin.polygons, point_cloud, x_offset_to_bumper,
+        vehicle_info);
+    }
+  }
 
   // update pointcloud_stop_candidates
   const auto latest_point_cloud_time =
@@ -669,7 +740,8 @@ std::optional<StopObstacle> ObstacleStopModule::pick_stop_obstacle_from_predicte
   const std::shared_ptr<PlannerData::Object> object, const rclcpp::Time & predicted_objects_stamp,
   const double dist_from_obj_poly_to_traj_poly, const VehicleInfo & vehicle_info,
   const double x_offset_to_bumper,
-  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check) const
+  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler) const
 {
   autoware_utils_debug::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -706,9 +778,19 @@ std::optional<StopObstacle> ObstacleStopModule::pick_stop_obstacle_from_predicte
   // calculate collision points with trajectory with lateral stop margin
   const auto & p = trajectory_polygon_collision_check;
   const auto & obj_vel = predicted_object.kinematics.initial_twist_with_covariance.twist.linear;
+  const bool is_obstacle_in_narrow_lane =
+    is_position_in_narrow_lane_lanelet(route_handler, obj_pose.position);
+  RCLCPP_WARN_THROTTLE(
+    logger_, *clock_, 1000, "[NARROW-DEBUG] obstacle (%s) is_obstacle_in_narrow_lane=%d",
+    obj_uuid_str.substr(0, 4).c_str(), is_obstacle_in_narrow_lane);
+  if (is_obstacle_in_narrow_lane) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000, "[Stop] obstacle (%s) in narrow_lane lanelet: applying margin %2.2f",
+      obj_uuid_str.substr(0, 4).c_str(), filtering_params.lateral_margin.narrow_lane_margin);
+  }
   const auto polygon_param = create_polygon_param(
     filtering_params.trim_trajectory, calc_ego_forwarding_braking_distance(traj_points, odometry),
-    filtering_params.lateral_margin, std::hypot(obj_vel.x, obj_vel.y));
+    filtering_params.lateral_margin, std::hypot(obj_vel.x, obj_vel.y), is_obstacle_in_narrow_lane);
   const auto detection_polygon_with_lat_margin = get_trajectory_polygon(
     decimated_traj_points, vehicle_info, odometry.pose.pose, polygon_param,
     p.enable_to_consider_current_pose, p.time_to_convergence, p.decimate_trajectory_step_length);

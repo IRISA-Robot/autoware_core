@@ -106,10 +106,16 @@ struct ObstacleFilteringParam
     double is_moving_threshold_velocity{};
     double additional_is_stop_margin{};
     double additional_is_moving_margin{};
+    // Dedicated margin applied instead of nominal_margin when the obstacle sits inside a
+    // `narrow_lane`-tagged lanelet (see the static_obstacle_avoidance narrow_lane escape hatch).
+    // Permissive coarse pre-filter: max_margin() takes the larger of the two so this never makes
+    // the rough lateral-distance filter reject a candidate too early.
+    double narrow_lane_margin{};
 
     double max_margin(const VehicleInfo & vehicle_info) const
     {
-      return nominal_margin + additional_wheel_off_track_scale * vehicle_info.wheel_base_m +
+      return std::max(nominal_margin, narrow_lane_margin) +
+             additional_wheel_off_track_scale * vehicle_info.wheel_base_m +
              std::max(additional_is_stop_margin, additional_is_moving_margin);
     };
   } lateral_margin;
@@ -154,6 +160,19 @@ struct ObstacleFilteringParam
       node, param_prefix + "lateral_margin.additional.is_stop_obstacle", label_str);
     lateral_margin.additional_is_moving_margin = get_object_parameter<double>(
       node, param_prefix + "lateral_margin.additional.is_moving_obstacle", label_str);
+
+    // NOTE: not yet exposed via the standard per-label yaml fallback chain (a later tuning pass
+    // will add the real default value); use an explicit has_parameter/declare_parameter fallback
+    // instead of the throwing get_object_parameter() so missing yaml doesn't abort startup. This
+    // is a single generic key (not per-label), so guard against re-declaring it across the
+    // per-label ObstacleFilteringParam construction loop in ObstacleStopModule::init().
+    {
+      const std::string narrow_lane_margin_key = param_prefix + "lateral_margin.narrow_lane_margin";
+      lateral_margin.narrow_lane_margin = node.has_parameter(narrow_lane_margin_key)
+                                             ? node.get_parameter(narrow_lane_margin_key).as_double()
+                                             : node.declare_parameter<double>(
+                                                 narrow_lane_margin_key, 0.0);
+    }
 
     min_velocity_to_reach_collision_point = get_object_parameter<double>(
       node, param_prefix + "min_velocity_to_reach_collision_point", label_str);
