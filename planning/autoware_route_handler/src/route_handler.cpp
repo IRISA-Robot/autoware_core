@@ -2386,34 +2386,67 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
       "length2d=%.2f",
       st_llt.id(), (optional_route ? "true" : "false"), (is_proper_angle ? "true" : "false"),
       angle_diff * 180.0 / M_PI, (optional_route ? optional_route->length2d() : -1.0));
-    if (!optional_route || !is_proper_angle) {
+    // [REVERSE-UNREACHABLE-FIX 2026-09-03] The angle gate is the only one that may skip this
+    // start lanelet outright: it is a property of ego's physical pose in `st_llt`, so it applies
+    // identically to the forward and the reverse-departing candidate (reversing does not rotate
+    // the vehicle -- see the long note in the reverse block below), and the reverse block's own
+    // `is_proper_angle` guards would reject the candidate anyway.
+    //
+    // A MISSING FORWARD ROUTE MUST NOT SKIP THE LANELET. Previously this was a single
+    // `if (!optional_route || !is_proper_angle) { continue; }`, which sat ABOVE the entire
+    // reverse-start / reverse-goal block further down -- so the reverse candidates were only ever
+    // evaluated when a forward route to the same goal ALREADY existed. That is the exact inverse
+    // of the case this whole feature exists for: when the goal is behind ego,
+    // `getRoute(st_llt, goal_lanelet, 0)` correctly finds nothing, the loop `continue`d, and the
+    // reverse block was unreachable dead code. Reverse driving could therefore never be planned,
+    // no matter how the map was tagged or how the policy flags were set.
+    //
+    // Confirmed against the 2026-09-03 field log (latest_pure.log) on map_kantor_luar, whose
+    // lanelets form the open chain 80-7-93-14-103-21-109-28-33-116-40-45-67 (no loop):
+    //   start lane 28, goal lane 21 (i.e. 21 is BEHIND 28)
+    //   -> "forward candidate: st_llt=28 found=false", then NO reverse-start gate line at all
+    //      (that debug print is unconditional, so its absence proves the `continue` fired),
+    //      then "final path_lanelets (is_route_found=false): [ ]" and route request rejected.
+    // A standalone lanelet2 check on that same map confirms the graph itself was never the
+    // problem -- getRoute(28, 21) is NOT FOUND while getRoute(28.invert(), 21.invert()) IS FOUND
+    // (length2d=48.25, path 28 -> 109 -> 21), and following(28.invert()) == [109], i.e. the
+    // inverted edges the reverse block wants are present and reachable.
+    if (!is_proper_angle) {
       RCLCPP_DEBUG_STREAM(
-        logger_, "Failed to find a proper route!"
+        logger_, "Start lanelet rejected on heading angle."
+                   << std::endl
+                   << " - start checkpoint: " << toString(start_checkpoint) << std::endl
+                   << " - start lane id: " << st_llt.id() << std::endl);
+      continue;
+    }
+    if (!optional_route) {
+      RCLCPP_DEBUG_STREAM(
+        logger_, "No forward route from this start lanelet; still trying reverse candidates."
                    << std::endl
                    << " - start checkpoint: " << toString(start_checkpoint) << std::endl
                    << " - goal checkpoint: " << toString(goal_checkpoint) << std::endl
                    << " - start lane id: " << st_llt.id() << std::endl
                    << " - goal lane id: " << goal_lanelet.id() << std::endl);
-      continue;
-    }
-    is_route_found = true;
-    lanelet::ConstLanelet preferred_lane{};
-    if (getClosestPreferredLaneletWithinRoute(start_checkpoint, &preferred_lane)) {
-      if (st_llt.id() == preferred_lane.id()) {
+    } else {
+      is_route_found = true;
+      lanelet::ConstLanelet preferred_lane{};
+      if (getClosestPreferredLaneletWithinRoute(start_checkpoint, &preferred_lane)) {
+        if (st_llt.id() == preferred_lane.id()) {
+          shortest_path = optional_route->shortestPath();
+          start_lanelet = st_llt;
+          break;
+        }
+      }
+      const double optional_route_length = optional_route->length2d();
+      const double optional_route_cost = optional_route_length + angle_diff_weight * angle_diff;
+      RCLCPP_DEBUG(
+        logger_, "Lanelet ID %ld: Route length = %.1f, Angle Diff = %.4f rad, Route cost = %.2f",
+        st_llt.id(), optional_route_length, angle_diff, optional_route_cost);
+      if (optional_route_cost < min_route_cost) {
+        min_route_cost = optional_route_cost;
         shortest_path = optional_route->shortestPath();
         start_lanelet = st_llt;
-        break;
       }
-    }
-    const double optional_route_length = optional_route->length2d();
-    const double optional_route_cost = optional_route_length + angle_diff_weight * angle_diff;
-    RCLCPP_DEBUG(
-      logger_, "Lanelet ID %ld: Route length = %.1f, Angle Diff = %.4f rad, Route cost = %.2f",
-      st_llt.id(), optional_route_length, angle_diff, optional_route_cost);
-    if (optional_route_cost < min_route_cost) {
-      min_route_cost = optional_route_cost;
-      shortest_path = optional_route->shortestPath();
-      start_lanelet = st_llt;
     }
 
     // Also consider the *inverted* (reverse-departing) orientation of this same start lanelet.

@@ -394,9 +394,38 @@ void EKFLocalizer::publish_diagnostics(
     diag_status_array.push_back(check_measurement_delay_gate(
       "twist", twist_diag_info_.is_passed_delay_gate, twist_diag_info_.delay_time,
       twist_diag_info_.delay_time_threshold));
+    // [GAMA] Gate Mahalanobis twist: laporkan sebagai WARN hanya kalau penolakannya
+    // BERTAHAN, bukan pada satu sampel yang meleset.
+    //
+    // check_measurement_mahalanobis_gate() (diagnostics.cpp:154-157) menaikkan level ke
+    // WARN begitu SATU pengukuran ditolak -- tanpa counter, histeresis, atau parameter
+    // apa pun. Sementara check_measurement_updated() di atas punya toleransi
+    // twist_no_update_count_threshold_warn. Keduanya digabung merge_diagnostic_status()
+    // yang mengambil level terburuk, sehingga gate Mahalanobis menembus toleransi itu
+    // dan membuatnya tidak berguna.
+    //
+    // Dampaknya di robot ini: satu lonjakan twist -> WARN seketika ->
+    // /autoware/localization/sensor_fusion_status WARN -> /autoware/localization WARN
+    // (tipe "and") -> /autoware/modes/autonomous gugur -> mrm_handler EMERGENCY_STOP ->
+    // robot berhenti. Terhitung 7x dalam 272 detik di latest_pure.log, meskipun
+    // toleransi no_update_count sudah dinaikkan ke 250 (5 detik).
+    //
+    // AMAN karena penolakan gate SUDAH dihitung di tempat lain: baris 226 menaikkan
+    // twist_diag_info_.no_update_count setiap kali measurement_update_twist() gagal,
+    // termasuk gagal karena gate ini. Jadi penolakan yang benar-benar berkepanjangan
+    // tetap memicu WARN lewat check_measurement_updated() setelah 5 detik. Yang
+    // disenyapkan hanya penolakan sesaat.
+    //
+    // KeyValue-nya (jarak Mahalanobis + threshold) TETAP dipublish apa adanya, jadi
+    // visibilitas untuk debug tidak berkurang -- hanya LEVEL-nya yang jadi toleran.
+    //
+    // Pose sengaja TIDAK diubah: pose yang ditolak berarti NDT dan EKF berbeda pendapat
+    // soal posisi, jauh lebih serius, dan pantas langsung berbunyi.
+    const bool twist_rejection_is_sustained =
+      twist_diag_info_.no_update_count >= params_.twist_no_update_count_threshold_warn;
     diag_status_array.push_back(check_measurement_mahalanobis_gate(
-      "twist", twist_diag_info_.is_passed_mahalanobis_gate, twist_diag_info_.mahalanobis_distance,
-      params_.twist_gate_dist));
+      "twist", twist_diag_info_.is_passed_mahalanobis_gate || !twist_rejection_is_sustained,
+      twist_diag_info_.mahalanobis_distance, params_.twist_gate_dist));
 
     geometry_msgs::msg::PoseWithCovariance pose_cov;
     pose_cov.pose = current_ekf_pose.pose;
