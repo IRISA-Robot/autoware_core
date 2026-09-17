@@ -32,6 +32,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -311,27 +312,46 @@ void MotionVelocityPlannerNode::on_trajectory(
   std::map<std::string, double> processing_times;
   stop_watch.tic("Total");
 
-  if (!update_planner_data(processing_times, input_trajectory_msg->points)) {
+  // Everything that touches the incoming trajectory runs inside this try. Planning an input
+  // this node cannot handle must cost that one message, not the process: these are composable
+  // nodes, so an exception escaping here aborts the container and takes every sibling component
+  // with it. That is how elastic_band_smoother and path_optimizer died alongside this node on
+  // 2026-09-16, out of a single std::out_of_range thrown while decimating a trajectory that
+  // folded back on itself. Dropping the message leaves the last good trajectory standing for the
+  // controller, which is the same outcome as a late cycle and a far better one than silence.
+  autoware_planning_msgs::msg::Trajectory output_trajectory_msg;
+  try {
+    if (!update_planner_data(processing_times, input_trajectory_msg->points)) {
+      return;
+    }
+    processing_times["update_planner_data"] = stop_watch.toc(true);
+
+    if (input_trajectory_msg->points.empty()) {
+      RCLCPP_WARN(get_logger(), "Input trajectory message is empty");
+      return;
+    }
+
+    if (has_received_map_) {
+      planner_data_->route_handler = std::make_shared<route_handler::RouteHandler>(*map_ptr_);
+      has_received_map_ = false;
+      processing_times["make_RouteHandler"] = stop_watch.toc(true);
+    }
+
+    autoware::motion_velocity_planner::TrajectoryPoints input_trajectory_points{
+      input_trajectory_msg->points.begin(), input_trajectory_msg->points.end()};
+    output_trajectory_msg = generate_trajectory(input_trajectory_points, processing_times);
+    output_trajectory_msg.header = input_trajectory_msg->header;
+    processing_times["generate_trajectory"] = stop_watch.toc(true);
+  } catch (const std::exception & e) {
+    ++dropped_trajectory_count_;
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "dropped an input trajectory (%zu points): planning it threw \"%s\". This node has now "
+      "dropped %zu trajectories; the last published one still stands. An input that reaches this "
+      "path is malformed -- check the behavior path for a fold ([PATH-FOLD] in behavior_path_planner).",
+      input_trajectory_msg->points.size(), e.what(), dropped_trajectory_count_);
     return;
   }
-  processing_times["update_planner_data"] = stop_watch.toc(true);
-
-  if (input_trajectory_msg->points.empty()) {
-    RCLCPP_WARN(get_logger(), "Input trajectory message is empty");
-    return;
-  }
-
-  if (has_received_map_) {
-    planner_data_->route_handler = std::make_shared<route_handler::RouteHandler>(*map_ptr_);
-    has_received_map_ = false;
-    processing_times["make_RouteHandler"] = stop_watch.toc(true);
-  }
-
-  autoware::motion_velocity_planner::TrajectoryPoints input_trajectory_points{
-    input_trajectory_msg->points.begin(), input_trajectory_msg->points.end()};
-  auto output_trajectory_msg = generate_trajectory(input_trajectory_points, processing_times);
-  output_trajectory_msg.header = input_trajectory_msg->header;
-  processing_times["generate_trajectory"] = stop_watch.toc(true);
 
   lk.unlock();
 

@@ -40,6 +40,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -117,6 +118,13 @@ private:
   MotionVelocityPlannerManager planner_manager_;
   LaneletMapBin::ConstSharedPtr map_ptr_{nullptr};
   bool has_received_map_ = false;
+  /// How many input trajectories have been dropped because planning them threw. A trajectory
+  /// that folds back on itself reaches indexing code here that assumes it does not, and an
+  /// escaping exception takes the whole component container down with this node -- on
+  /// 2026-09-16 it killed elastic_band_smoother and path_optimizer too, leaving a process that
+  /// looked alive with no trajectory behind it. Counted so the drops are visible rather than
+  /// merely survived.
+  size_t dropped_trajectory_count_ = 0;
 
   rclcpp::Service<LoadPlugin>::SharedPtr srv_load_plugin_;
   rclcpp::Service<UnloadPlugin>::SharedPtr srv_unload_plugin_;
