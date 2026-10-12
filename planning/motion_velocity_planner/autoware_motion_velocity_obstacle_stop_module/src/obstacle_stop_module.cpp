@@ -217,11 +217,50 @@ bool is_position_in_narrow_lane_lanelet(
   return false;
 }
 
+// `custom_obstacle_margin` lanelet tag: a per-lanelet override of nominal_margin that carries its
+// own VALUE, e.g. `custom_obstacle_margin=0.03`.  Deliberately separate from `narrow_lane`, which
+// is boolean and pairs with the module-wide narrow_lane_margin; this one lets two different gates
+// on the same route ask for two different margins without a rebuild.
+//
+// Written for the Higashida gates (lanelets 789 and 777): two fixed obstacles about 1.0 m apart.
+// With vehicle_width 0.70 m the body clears each side by 0.15 m, but nominal_margin 0.10 leaves
+// only 0.05 m of slack, which localisation and lateral tracking error eat on a curve.
+//
+// NARROWING ONLY.  The value is clamped to nominal_margin by the caller, because the coarse
+// pre-filter upstream sizes its search from LateralMarginParam::max_margin(), which cannot see a
+// per-position tag: a tag asking for MORE margin than nominal would widen the precise check while
+// the rough filter had already dropped the candidate, and the obstacle would be missed entirely.
+// A tag asking for less is always safe against that filter.
+std::optional<double> get_custom_obstacle_margin(
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler,
+  const geometry_msgs::msg::Point & position)
+{
+  constexpr const char * tag = "custom_obstacle_margin";
+  if (!route_handler) return std::nullopt;
+  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
+  if (!lanelet_map_ptr) return std::nullopt;
+
+  const lanelet::BasicPoint2d point(position.x, position.y);
+  constexpr double search_margin = 0.1;
+  const lanelet::BoundingBox2d bbox(
+    lanelet::BasicPoint2d(position.x - search_margin, position.y - search_margin),
+    lanelet::BasicPoint2d(position.x + search_margin, position.y + search_margin));
+  for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
+    if (!ll.hasAttribute(tag)) continue;
+    if (boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) continue;
+    const auto value = ll.attribute(tag).asDouble();
+    if (!value) continue;  // tag present but not a number: ignore rather than guess
+    return *value;
+  }
+  return std::nullopt;
+}
+
 PolygonParam create_polygon_param(
   const ObstacleFilteringParam::TrimTrajectoryParam & trim_trajectory_param,
   const std::optional<double> ego_braking_distance,
   const ObstacleFilteringParam::LateralMarginParam & lateral_margin_param,
-  const std::optional<double> object_velocity, const bool is_obstacle_in_narrow_lane = false)
+  const std::optional<double> object_velocity, const bool is_obstacle_in_narrow_lane = false,
+  const std::optional<double> custom_obstacle_margin = std::nullopt)
 {
   PolygonParam p;
   if (!trim_trajectory_param.enable_trimming || !ego_braking_distance.has_value()) {
@@ -231,9 +270,14 @@ PolygonParam create_polygon_param(
       trim_trajectory_param.min_trajectory_length +
       trim_trajectory_param.braking_distance_scale_factor * ego_braking_distance.value();
   }
-  const double nominal_margin = is_obstacle_in_narrow_lane
+  const double tag_free_margin = is_obstacle_in_narrow_lane
                                    ? lateral_margin_param.narrow_lane_margin
                                    : lateral_margin_param.nominal_margin;
+  // `custom_obstacle_margin` wins over both, but may only NARROW -- see
+  // get_custom_obstacle_margin() for why widening past nominal_margin would be unsound here.
+  const double nominal_margin = custom_obstacle_margin
+                                  ? std::min(*custom_obstacle_margin, tag_free_margin)
+                                  : tag_free_margin;
   p.lateral_margin = nominal_margin +
                      (object_velocity > lateral_margin_param.is_moving_threshold_velocity
                         ? lateral_margin_param.additional_is_moving_margin
@@ -651,14 +695,24 @@ std::vector<StopObstacle> ObstacleStopModule::filter_stop_obstacle_for_point_clo
     RCLCPP_WARN_THROTTLE(
       logger_, *clock_, 1000, "[NARROW-DEBUG] pointcloud is_obstacle_in_narrow_lane=%d",
       is_obstacle_in_narrow_lane);
-    if (is_obstacle_in_narrow_lane) {
-      RCLCPP_WARN_THROTTLE(
-        logger_, *clock_, 1000,
-        "[Stop] pointcloud obstacle in narrow_lane lanelet: applying margin %2.2f",
-        filtering_param.lateral_margin.narrow_lane_margin);
+    const auto custom_obstacle_margin =
+      get_custom_obstacle_margin(route_handler, nearest_collision_point->point);
+    if (is_obstacle_in_narrow_lane || custom_obstacle_margin) {
+      if (custom_obstacle_margin) {
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 1000,
+          "[Stop] pointcloud obstacle in a custom_obstacle_margin lanelet: applying margin %2.2f",
+          *custom_obstacle_margin);
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 1000,
+          "[Stop] pointcloud obstacle in narrow_lane lanelet: applying margin %2.2f",
+          filtering_param.lateral_margin.narrow_lane_margin);
+      }
       polygon_param = create_polygon_param(
         filtering_param.trim_trajectory, calc_ego_forwarding_braking_distance(traj_points, odometry),
-        filtering_param.lateral_margin, std::nullopt, is_obstacle_in_narrow_lane);
+        filtering_param.lateral_margin, std::nullopt, is_obstacle_in_narrow_lane,
+        custom_obstacle_margin);
       const auto detection_polygon_with_narrow_lane_margin = get_trajectory_polygon(
         decimated_traj_points, vehicle_info, odometry.pose.pose, polygon_param,
         tp.enable_to_consider_current_pose, tp.time_to_convergence,
@@ -788,9 +842,17 @@ std::optional<StopObstacle> ObstacleStopModule::pick_stop_obstacle_from_predicte
       logger_, *clock_, 1000, "[Stop] obstacle (%s) in narrow_lane lanelet: applying margin %2.2f",
       obj_uuid_str.substr(0, 4).c_str(), filtering_params.lateral_margin.narrow_lane_margin);
   }
+  const auto custom_obstacle_margin = get_custom_obstacle_margin(route_handler, obj_pose.position);
+  if (custom_obstacle_margin) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[Stop] obstacle (%s) in a custom_obstacle_margin lanelet: applying margin %2.2f",
+      obj_uuid_str.substr(0, 4).c_str(), *custom_obstacle_margin);
+  }
   const auto polygon_param = create_polygon_param(
     filtering_params.trim_trajectory, calc_ego_forwarding_braking_distance(traj_points, odometry),
-    filtering_params.lateral_margin, std::hypot(obj_vel.x, obj_vel.y), is_obstacle_in_narrow_lane);
+    filtering_params.lateral_margin, std::hypot(obj_vel.x, obj_vel.y), is_obstacle_in_narrow_lane,
+    custom_obstacle_margin);
   const auto detection_polygon_with_lat_margin = get_trajectory_polygon(
     decimated_traj_points, vehicle_info, odometry.pose.pose, polygon_param,
     p.enable_to_consider_current_pose, p.time_to_convergence, p.decimate_trajectory_step_length);
