@@ -2165,35 +2165,58 @@ size_t findFirstNearestIndexWithSoftConstraints(
   validateNonEmpty(points);
 
   {  // with dist and yaw thresholds
+    // The first run of points within both thresholds of `target`, and the nearest point in it.
     const double squared_dist_threshold = dist_threshold * dist_threshold;
-    double min_squared_dist = std::numeric_limits<double>::max();
-    size_t min_idx = 0;
-    bool is_within_constraints = false;
-    for (size_t i = 0; i < points.size(); ++i) {
-      const auto squared_dist =
-        autoware_utils_geometry::calc_squared_distance2d(points.at(i), pose.position);
-      const auto yaw = autoware_utils_geometry::calc_yaw_deviation(
-        autoware_utils_geometry::get_pose(points.at(i)), pose);
+    const auto find_within = [&](const geometry_msgs::msg::Pose & target) {
+      double min_squared_dist = std::numeric_limits<double>::max();
+      std::optional<size_t> min_idx;
+      for (size_t i = 0; i < points.size(); ++i) {
+        const auto squared_dist =
+          autoware_utils_geometry::calc_squared_distance2d(points.at(i), target.position);
+        const auto yaw = autoware_utils_geometry::calc_yaw_deviation(
+          autoware_utils_geometry::get_pose(points.at(i)), target);
 
-      if (squared_dist_threshold < squared_dist || yaw_threshold < std::abs(yaw)) {
-        if (is_within_constraints) {
-          break;
+        if (squared_dist_threshold < squared_dist || yaw_threshold < std::abs(yaw)) {
+          if (min_idx) {
+            break;
+          }
+          continue;
         }
-        continue;
+
+        if (min_squared_dist <= squared_dist) {
+          continue;
+        }
+
+        min_squared_dist = squared_dist;
+        min_idx = i;
       }
-
-      if (min_squared_dist <= squared_dist) {
-        continue;
-      }
-
-      min_squared_dist = squared_dist;
-      min_idx = i;
-      is_within_constraints = true;
-    }
-
-    // nearest index is found
-    if (is_within_constraints) {
       return min_idx;
+    };
+
+    const auto nose_idx = find_within(pose);
+    // A path driven in reverse whose yaw is the direction of travel matches only the flipped
+    // heading.  Where it turns back on itself (a U-turn) or runs beside a leg going the other
+    // way, part of it matches the nose too, metres from ego -- taking that first put ego on the
+    // wrong part of the path.  Try both headings and keep the nearer match.  Forward driving is
+    // unchanged unless a reversed stretch lies nearer to ego than its own path.
+    std::optional<size_t> travel_idx;
+    if (yaw_threshold < M_PI_2) {
+      auto flipped_pose = pose;
+      flipped_pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(
+        autoware_utils_geometry::get_rpy(pose).z + M_PI);
+      travel_idx = find_within(flipped_pose);
+    }
+    if (nose_idx && travel_idx) {
+      const auto squared_dist_to = [&](const size_t i) {
+        return autoware_utils_geometry::calc_squared_distance2d(points.at(i), pose.position);
+      };
+      return squared_dist_to(*travel_idx) < squared_dist_to(*nose_idx) ? *travel_idx : *nose_idx;
+    }
+    if (nose_idx) {
+      return *nose_idx;
+    }
+    if (travel_idx) {
+      return *travel_idx;
     }
   }
 
