@@ -28,10 +28,12 @@
 #include <autoware_planning_msgs/msg/trajectory_point.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -2165,58 +2167,75 @@ size_t findFirstNearestIndexWithSoftConstraints(
   validateNonEmpty(points);
 
   {  // with dist and yaw thresholds
-    // The first run of points within both thresholds of `target`, and the nearest point in it.
+    // Compare ego's nose with the heading the robot's body would have at each point.  Where the
+    // point is driven forward that is its yaw, as upstream.  Where it is driven in reverse
+    // (negative velocity) it is the direction of travel -- the order of the points -- turned
+    // around, whatever convention the yaw was written in: reverse_lane_follow writes the travel
+    // direction, freespace the body heading.  Taking the yaw of a travel-direction reversed point
+    // at face value matched the *other* leg wherever a route comes back over or beside itself
+    // (a U-turn, an out-and-back), and ego was put on the wrong part of the path.
     const double squared_dist_threshold = dist_threshold * dist_threshold;
-    const auto find_within = [&](const geometry_msgs::msg::Pose & target) {
-      double min_squared_dist = std::numeric_limits<double>::max();
-      std::optional<size_t> min_idx;
-      for (size_t i = 0; i < points.size(); ++i) {
-        const auto squared_dist =
-          autoware_utils_geometry::calc_squared_distance2d(points.at(i), target.position);
-        const auto yaw = autoware_utils_geometry::calc_yaw_deviation(
-          autoware_utils_geometry::get_pose(points.at(i)), target);
-
-        if (squared_dist_threshold < squared_dist || yaw_threshold < std::abs(yaw)) {
-          if (min_idx) {
-            break;
+    const auto body_yaw_deviation = [&](const size_t i) {
+      const auto & point_pose = autoware_utils_geometry::get_pose(points.at(i));
+      using PointT = std::decay_t<decltype(points.at(i))>;
+      if constexpr (
+        std::is_same_v<PointT, autoware_planning_msgs::msg::PathPoint> ||
+        std::is_same_v<PointT, autoware_internal_planning_msgs::msg::PathPointWithLaneId> ||
+        std::is_same_v<PointT, autoware_planning_msgs::msg::TrajectoryPoint>) {
+        if (autoware_utils_geometry::get_longitudinal_velocity(points.at(i)) < 0.0) {
+          const auto direction_of_travel = [&]() -> std::optional<double> {
+            const auto segment_yaw = [&](const size_t from, const size_t to) -> std::optional<double> {
+              const auto & p0 = autoware_utils_geometry::get_point(points.at(from));
+              const auto & p1 = autoware_utils_geometry::get_point(points.at(to));
+              if (std::hypot(p1.x - p0.x, p1.y - p0.y) < 1e-3) {
+                return std::nullopt;
+              }
+              return std::atan2(p1.y - p0.y, p1.x - p0.x);
+            };
+            if (i + 1 < points.size()) {
+              if (const auto yaw = segment_yaw(i, i + 1)) return yaw;
+            }
+            if (0 < i) {
+              if (const auto yaw = segment_yaw(i - 1, i)) return yaw;
+            }
+            return std::nullopt;
+          }();
+          if (direction_of_travel) {
+            return autoware_utils_math::normalize_radian(
+              *direction_of_travel + M_PI - autoware_utils_geometry::get_rpy(pose).z);
           }
-          continue;
         }
-
-        if (min_squared_dist <= squared_dist) {
-          continue;
-        }
-
-        min_squared_dist = squared_dist;
-        min_idx = i;
       }
-      return min_idx;
+      return autoware_utils_geometry::calc_yaw_deviation(point_pose, pose);
     };
 
-    const auto nose_idx = find_within(pose);
-    // A path driven in reverse whose yaw is the direction of travel matches only the flipped
-    // heading.  Where it turns back on itself (a U-turn) or runs beside a leg going the other
-    // way, part of it matches the nose too, metres from ego -- taking that first put ego on the
-    // wrong part of the path.  Try both headings and keep the nearer match.  Forward driving is
-    // unchanged unless a reversed stretch lies nearer to ego than its own path.
-    std::optional<size_t> travel_idx;
-    if (yaw_threshold < M_PI_2) {
-      auto flipped_pose = pose;
-      flipped_pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(
-        autoware_utils_geometry::get_rpy(pose).z + M_PI);
-      travel_idx = find_within(flipped_pose);
+    double min_squared_dist = std::numeric_limits<double>::max();
+    size_t min_idx = 0;
+    bool is_within_constraints = false;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const auto squared_dist =
+        autoware_utils_geometry::calc_squared_distance2d(points.at(i), pose.position);
+      const auto yaw = body_yaw_deviation(i);
+
+      if (squared_dist_threshold < squared_dist || yaw_threshold < std::abs(yaw)) {
+        if (is_within_constraints) {
+          break;
+        }
+        continue;
+      }
+
+      if (min_squared_dist <= squared_dist) {
+        continue;
+      }
+
+      min_squared_dist = squared_dist;
+      min_idx = i;
+      is_within_constraints = true;
     }
-    if (nose_idx && travel_idx) {
-      const auto squared_dist_to = [&](const size_t i) {
-        return autoware_utils_geometry::calc_squared_distance2d(points.at(i), pose.position);
-      };
-      return squared_dist_to(*travel_idx) < squared_dist_to(*nose_idx) ? *travel_idx : *nose_idx;
-    }
-    if (nose_idx) {
-      return *nose_idx;
-    }
-    if (travel_idx) {
-      return *travel_idx;
+
+    // nearest index is found
+    if (is_within_constraints) {
+      return min_idx;
     }
   }
 

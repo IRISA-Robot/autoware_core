@@ -4713,34 +4713,51 @@ TEST(trajectory, insertOrientationAsSplineWithHelicalBackwardPath)
   }
 }
 
-TEST(trajectory, findFirstNearestIndexWithSoftConstraints_ReversingBesideItsReturnLeg)
+TEST(trajectory, findFirstNearestIndexWithSoftConstraints_LegsGoingTheOtherWay)
 {
   using autoware::motion_utils::findFirstNearestIndexWithSoftConstraints;
-  using autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints;
   using autoware_planning_msgs::msg::TrajectoryPoint;
 
-  // A reversed path whose yaw is the direction of travel: +x, then a U-turn back along y = 2.5
-  // (yaw pi).  Ego reverses along the first leg, so its nose points -x -- the return leg's yaw.
-  const auto point = [](const double x, const double y, const double yaw) {
+  const auto point = [](const double x, const double y, const double yaw, const double v) {
     TrajectoryPoint p;
     p.pose.position = create_point(x, y, 0.0);
     p.pose.orientation = create_quaternion_from_rpy(0.0, 0.0, yaw);
+    p.longitudinal_velocity_mps = v;
     return p;
   };
-  const std::vector<TrajectoryPoint> traj{
-    point(0.0, 0.0, 0.0),  point(1.0, 0.0, 0.0),  point(2.0, 0.0, 0.0),  point(3.0, 0.0, 0.0),
-    point(3.0, 2.5, M_PI), point(2.0, 2.5, M_PI), point(1.0, 2.5, M_PI), point(0.0, 2.5, M_PI)};
+  const auto ego = [](const double x, const double y, const double yaw) {
+    geometry_msgs::msg::Pose pose;
+    pose.position = create_point(x, y, 0.0);
+    pose.orientation = create_quaternion_from_rpy(0.0, 0.0, yaw);
+    return pose;
+  };
 
-  geometry_msgs::msg::Pose reversing;
-  reversing.position = create_point(1.0, 0.0, 0.0);
-  reversing.orientation = create_quaternion_from_rpy(0.0, 0.0, M_PI);
-  EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, reversing, 3.0, 1.046), 1U);
-  EXPECT_EQ(findFirstNearestSegmentIndexWithSoftConstraints(traj, reversing, 3.0, 1.046), 0U);
-
-  // forward driving on the same leg is unchanged
-  geometry_msgs::msg::Pose forward = reversing;
-  forward.orientation = create_quaternion_from_rpy(0.0, 0.0, 0.0);
-  EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, forward, 3.0, 1.046), 1U);
+  // Reversing with yaw = direction of travel (reverse_lane_follow): +x, then a U-turn back along
+  // y = 2.5.  Ego reverses along the first leg, nose -x: the return leg's yaw, 2.5 m away.
+  {
+    const std::vector<TrajectoryPoint> traj{
+      point(0.0, 0.0, 0.0, -1.0),  point(1.0, 0.0, 0.0, -1.0),  point(2.0, 0.0, 0.0, -1.0),
+      point(3.0, 0.0, 0.0, -1.0),  point(3.0, 2.5, M_PI, -1.0), point(2.0, 2.5, M_PI, -1.0),
+      point(1.0, 2.5, M_PI, -1.0), point(0.0, 2.5, M_PI, -1.0)};
+    EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, ego(1.0, 0.0, M_PI), 3.0, 1.046), 1U);
+  }
+  // The same reversed path with yaw = body heading (freespace): unchanged result.
+  {
+    const std::vector<TrajectoryPoint> traj{
+      point(0.0, 0.0, M_PI, -1.0), point(1.0, 0.0, M_PI, -1.0), point(2.0, 0.0, M_PI, -1.0),
+      point(3.0, 0.0, M_PI, -1.0), point(3.0, 2.5, 0.0, -1.0),  point(2.0, 2.5, 0.0, -1.0),
+      point(1.0, 2.5, 0.0, -1.0),  point(0.0, 2.5, 0.0, -1.0)};
+    EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, ego(1.0, 0.0, M_PI), 3.0, 1.046), 1U);
+  }
+  // Driving forward out and back over the same ground: the return leg lies 0.1 m nearer to ego
+  // than its own leg, but runs the other way -- ego stays on its own leg.
+  {
+    const std::vector<TrajectoryPoint> traj{
+      point(0.0, 0.3, 0.0, 1.0),  point(1.0, 0.3, 0.0, 1.0),  point(2.0, 0.3, 0.0, 1.0),
+      point(3.0, 0.3, 0.0, 1.0),  point(3.0, 0.2, M_PI, 1.0), point(2.0, 0.2, M_PI, 1.0),
+      point(1.0, 0.2, M_PI, 1.0), point(0.0, 0.2, M_PI, 1.0)};
+    EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, ego(1.0, 0.0, 0.0), 3.0, 1.046), 1U);
+  }
 }
 
 TEST(trajectory, findFirstNearestIndexWithSoftConstraints)
