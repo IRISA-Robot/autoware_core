@@ -1849,7 +1849,15 @@ PathWithLaneId RouteHandler::getCenterLinePath(
       };
     }
 
-    const auto centerline = lanelet::utils::getCenterlineWithRatioProfile(llt, ratio_at_s);
+    // Resample at 1 m, not at the function's 5 m default.  A 5 m chord cuts the inside of a
+    // curve by ~0.67 m at R 5 m and ~1.3 m at R 3 m, a lanelet under 5 m collapses into one
+    // chord, and the Akima spline downstream bulges the outside by ~7 % of the spacing --
+    // on narrow lanes that alone puts the robot's body over the boundary.  The sparse
+    // (5 m + seam drops) path is also what let the nearest-point searches anchor 17-21 m
+    // from the robot.  Every consumer (lane following, reverse_lane_follow) assumed ~1 m.
+    constexpr double centerline_resolution = 1.0;  // [m]
+    const auto centerline =
+      lanelet::utils::getCenterlineWithRatioProfile(llt, ratio_at_s, centerline_resolution);
 
     piecewise_ref_points_vec.push_back(std::vector<ReferencePoint>{});
     for (const auto & center_point : centerline) {
