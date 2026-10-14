@@ -20,6 +20,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
+
 namespace autoware::route_handler::test
 {
 TEST_F(TestRouteHandler, isRouteHandlerReadyTest)
@@ -278,6 +281,41 @@ TEST_F(TestRouteHandler, testGetCenterLinePath)
     ASSERT_EQ(center_line_path.points.back().lane_ids.at(0), 4785);
   }
 }
+TEST_F(TestRouteHandler, centerLinePathHasNoSidewaysStepWhereLateralRatioChanges)
+{
+  // The middle lanelet asks for a lateral bias, its neighbours do not.  Both sides of each seam
+  // must meet at the same ratio; they used to end on the neighbour's ratio and start on their
+  // own, which stepped the path sideways at the seam.
+  constexpr double blend = 3.0;
+  route_handler_->setPreferLateralRatioBlendDistance(blend);
+  route_handler_->getLaneletMapPtr()->laneletLayer.get(4780).setAttribute(
+    "prefer_lateral_ratio", -0.3);
+  const auto current_lanes = route_handler_->getLaneletsFromIds({4424, 4780, 4785});
+  const auto path = route_handler_->getCenterLinePath(current_lanes, 0.0, 200.0);
+  ASSERT_GE(path.points.size(), 3u);
+
+  double max_turn = 0.0;
+  double max_lateral_offset = 0.0;
+  const auto & front = path.points.front().point.pose.position;
+  const auto & back = path.points.back().point.pose.position;
+  const double axis = std::atan2(back.y - front.y, back.x - front.x);
+  for (size_t i = 0; i + 2 < path.points.size(); ++i) {
+    const auto & p0 = path.points.at(i).point.pose.position;
+    const auto & p1 = path.points.at(i + 1).point.pose.position;
+    const auto & p2 = path.points.at(i + 2).point.pose.position;
+    const double a = std::atan2(p1.y - p0.y, p1.x - p0.x);
+    const double b = std::atan2(p2.y - p1.y, p2.x - p1.x);
+    max_turn = std::max(max_turn, std::abs(std::atan2(std::sin(b - a), std::cos(b - a))));
+    max_lateral_offset = std::max(
+      max_lateral_offset,
+      std::abs(-(p1.x - front.x) * std::sin(axis) + (p1.y - front.y) * std::cos(axis)));
+  }
+  // the bias itself is applied (the lanes are straight, so any offset is the bias) ...
+  EXPECT_GT(max_lateral_offset, 0.3);
+  // ... as a ramp, not a step: a 0.5 m step between points ~1 m apart turns ~27 deg
+  EXPECT_LT(max_turn, 10.0 * M_PI / 180.0);
+}
+
 TEST_F(TestRouteHandler, DISABLED_testGetCenterLinePathWhenLanesIsNotConnected)
 {
   // broken current lanes. 4424 and 4785 are not connected directly.

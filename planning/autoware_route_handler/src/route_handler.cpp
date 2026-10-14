@@ -1867,29 +1867,44 @@ PathWithLaneId RouteHandler::getCenterLinePath(
     const double r_next =
       (i + 1 == lanelet_sequence.size()) ? r_i : getPreferLateralRatio(lanelet_sequence.at(i + 1));
 
-    const double llt_length = static_cast<double>(lanelet::geometry::length(llt.centerline()));
+    // [SEAM-RATIO 2026-10-14] Both sides of a seam must end on the same ratio, or the reference
+    // steps sideways there.  This used to end lanelet i on r_next and start lanelet i+1 on r_i --
+    // two different values whenever the neighbours' tags differ.  Measured on hibikino_kanan
+    // 333 (no tag) -> 322 (-0.15): a 0.26 m sideways step between points 0.26 m apart, which the
+    // reverse path's seam-fold filter took as the new direction of travel and then deleted all of
+    // 322.  Meet at the mean of the two ratios instead.
+    const double r_start = 0.5 * (r_prev + r_i);
+    const double r_end = 0.5 * (r_i + r_next);
+
+    constexpr double centerline_resolution = 1.0;  // [m], see below
+    // s below is measured along the midline the ratio profile is applied to, so take the length
+    // of that same line; the stored centerline can differ by enough to leave the end of the ramp
+    // short of r_end.
+    const double llt_length = static_cast<double>(lanelet::geometry::length(
+      lanelet::utils::getCenterlineWithRatioProfile(
+        llt, [](const double) { return 0.0; }, centerline_resolution)));
     const double blend = prefer_lateral_ratio_blend_distance_m_;
 
     std::function<double(double)> ratio_at_s;
     if (llt_length < 2.0 * blend) {
       // Short-lanelet guard: no room for a flat plateau, ramp across the whole lanelet.
-      ratio_at_s = [r_prev, r_next, llt_length](const double s) -> double {
+      ratio_at_s = [r_start, r_end, llt_length](const double s) -> double {
         if (llt_length <= 0.0) {
-          return r_next;
+          return r_end;
         }
         const double t = std::clamp(s / llt_length, 0.0, 1.0);
-        return r_prev + (r_next - r_prev) * t;
+        return r_start + (r_end - r_start) * t;
       };
     } else {
-      ratio_at_s = [r_prev, r_i, r_next, llt_length, blend](const double s) -> double {
+      ratio_at_s = [r_start, r_i, r_end, llt_length, blend](const double s) -> double {
         if (s <= blend) {
           const double t = (blend > 0.0) ? std::clamp(s / blend, 0.0, 1.0) : 1.0;
-          return r_prev + (r_i - r_prev) * t;
+          return r_start + (r_i - r_start) * t;
         }
         if (s >= llt_length - blend) {
           const double t =
             (blend > 0.0) ? std::clamp((s - (llt_length - blend)) / blend, 0.0, 1.0) : 1.0;
-          return r_i + (r_next - r_i) * t;
+          return r_i + (r_end - r_i) * t;
         }
         return r_i;
       };
@@ -1901,7 +1916,6 @@ PathWithLaneId RouteHandler::getCenterLinePath(
     // on narrow lanes that alone puts the robot's body over the boundary.  The sparse
     // (5 m + seam drops) path is also what let the nearest-point searches anchor 17-21 m
     // from the robot.  Every consumer (lane following, reverse_lane_follow) assumed ~1 m.
-    constexpr double centerline_resolution = 1.0;  // [m]
     const auto centerline =
       lanelet::utils::getCenterlineWithRatioProfile(llt, ratio_at_s, centerline_resolution);
 
