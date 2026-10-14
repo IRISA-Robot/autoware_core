@@ -4749,6 +4749,16 @@ TEST(trajectory, findFirstNearestIndexWithSoftConstraints_LegsGoingTheOtherWay)
       point(1.0, 2.5, 0.0, -1.0),  point(0.0, 2.5, 0.0, -1.0)};
     EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, ego(1.0, 0.0, M_PI), 3.0, 1.046), 1U);
   }
+  // Searching a reversed path with one of its own poses (yaw = direction of travel), as
+  // pid_longitudinal_controller does to re-find its interpolated point: that point, not the goal.
+  {
+    const std::vector<TrajectoryPoint> traj{
+      point(5.0, 0.0, M_PI, -0.5), point(4.0, 0.0, M_PI, -0.5), point(3.0, 0.0, M_PI, -0.5),
+      point(2.0, 0.0, M_PI, -0.5), point(1.0, 0.0, M_PI, -0.25), point(0.0, 0.0, M_PI, 0.0)};
+    EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, ego(3.0, 0.0, M_PI), 3.0, 1.046), 2U);
+    // and with ego's pose (nose the other way) as well
+    EXPECT_EQ(findFirstNearestIndexWithSoftConstraints(traj, ego(3.0, 0.0, 0.0), 3.0, 1.046), 2U);
+  }
   // Driving forward out and back over the same ground: the return leg lies 0.1 m nearer to ego
   // than its own leg, but runs the other way -- ego stays on its own leg.
   {
