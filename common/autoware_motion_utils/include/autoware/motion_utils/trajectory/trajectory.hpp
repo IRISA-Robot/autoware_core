@@ -28,10 +28,12 @@
 #include <autoware_planning_msgs/msg/trajectory_point.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -2165,15 +2167,55 @@ size_t findFirstNearestIndexWithSoftConstraints(
   validateNonEmpty(points);
 
   {  // with dist and yaw thresholds
+    // Compare ego's nose with the heading the robot's body would have at each point.  Where the
+    // point is driven forward that is its yaw, as upstream.  Where it is driven in reverse
+    // (negative velocity) it is the direction of travel -- the order of the points -- turned
+    // around, whatever convention the yaw was written in: reverse_lane_follow writes the travel
+    // direction, freespace the body heading.  Taking the yaw of a travel-direction reversed point
+    // at face value matched the *other* leg wherever a route comes back over or beside itself
+    // (a U-turn, an out-and-back), and ego was put on the wrong part of the path.
     const double squared_dist_threshold = dist_threshold * dist_threshold;
+    const auto body_yaw_deviation = [&](const size_t i) {
+      const auto & point_pose = autoware_utils_geometry::get_pose(points.at(i));
+      using PointT = std::decay_t<decltype(points.at(i))>;
+      if constexpr (
+        std::is_same_v<PointT, autoware_planning_msgs::msg::PathPoint> ||
+        std::is_same_v<PointT, autoware_internal_planning_msgs::msg::PathPointWithLaneId> ||
+        std::is_same_v<PointT, autoware_planning_msgs::msg::TrajectoryPoint>) {
+        if (autoware_utils_geometry::get_longitudinal_velocity(points.at(i)) < 0.0) {
+          const auto direction_of_travel = [&]() -> std::optional<double> {
+            const auto segment_yaw = [&](const size_t from, const size_t to) -> std::optional<double> {
+              const auto & p0 = autoware_utils_geometry::get_point(points.at(from));
+              const auto & p1 = autoware_utils_geometry::get_point(points.at(to));
+              if (std::hypot(p1.x - p0.x, p1.y - p0.y) < 1e-3) {
+                return std::nullopt;
+              }
+              return std::atan2(p1.y - p0.y, p1.x - p0.x);
+            };
+            if (i + 1 < points.size()) {
+              if (const auto yaw = segment_yaw(i, i + 1)) return yaw;
+            }
+            if (0 < i) {
+              if (const auto yaw = segment_yaw(i - 1, i)) return yaw;
+            }
+            return std::nullopt;
+          }();
+          if (direction_of_travel) {
+            return autoware_utils_math::normalize_radian(
+              *direction_of_travel + M_PI - autoware_utils_geometry::get_rpy(pose).z);
+          }
+        }
+      }
+      return autoware_utils_geometry::calc_yaw_deviation(point_pose, pose);
+    };
+
     double min_squared_dist = std::numeric_limits<double>::max();
     size_t min_idx = 0;
     bool is_within_constraints = false;
     for (size_t i = 0; i < points.size(); ++i) {
       const auto squared_dist =
         autoware_utils_geometry::calc_squared_distance2d(points.at(i), pose.position);
-      const auto yaw = autoware_utils_geometry::calc_yaw_deviation(
-        autoware_utils_geometry::get_pose(points.at(i)), pose);
+      const auto yaw = body_yaw_deviation(i);
 
       if (squared_dist_threshold < squared_dist || yaw_threshold < std::abs(yaw)) {
         if (is_within_constraints) {
