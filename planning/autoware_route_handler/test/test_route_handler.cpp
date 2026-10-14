@@ -14,6 +14,7 @@
 
 #include "test_route_handler.hpp"
 
+
 #include <autoware_utils_geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 
@@ -35,6 +36,61 @@ TEST_F(TestRouteHandler, checkIfIDReturned)
   const auto lanelet2 = route_handler_->getLaneletsFromId(4780);
   const auto is_lanelet2_in_goal_route_section = route_handler_->isInGoalRouteSection(lanelet2);
   ASSERT_FALSE(is_lanelet2_in_goal_route_section);
+}
+
+TEST_F(TestRouteHandler, activeWindowLimitsGeometryButNotTheGoal)
+{
+  const auto full_lanelets = route_handler_->getPreferredLanelets();
+  const auto uuid = route_handler_->getRouteUuid();
+  lanelet::ConstLanelet goal_lane;
+  ASSERT_TRUE(route_handler_->getGoalLanelet(&goal_lane));
+  const auto goal_id = goal_lane.id();
+
+  // window = the first segment only
+  ASSERT_TRUE(route_handler_->setActiveWindow(uuid, 0, 0));
+  ASSERT_TRUE(route_handler_->getActiveWindow().has_value());
+  const auto windowed = route_handler_->getPreferredLanelets();
+  EXPECT_LT(windowed.size(), full_lanelets.size());
+  EXPECT_FALSE(windowed.empty());
+  for (const auto & llt : windowed) {
+    EXPECT_NE(llt.id(), goal_id);
+  }
+  // the goal is still found, from the full route
+  lanelet::ConstLanelet goal_in_window;
+  ASSERT_TRUE(route_handler_->getGoalLanelet(&goal_in_window));
+  EXPECT_EQ(goal_in_window.id(), goal_id);
+  EXPECT_TRUE(route_handler_->isInGoalRouteSection(goal_in_window));
+  // a position lookup cannot leave the window: even at the goal pose it does not return the
+  // goal lanelet, which lies outside it
+  lanelet::ConstLanelet closest;
+  ASSERT_TRUE(route_handler_->getClosestLaneletWithinRoute(
+    route_handler_->getGoalPose(), &closest));
+  EXPECT_NE(closest.id(), goal_id);
+
+  // clearing restores the full route
+  route_handler_->clearActiveWindow();
+  EXPECT_FALSE(route_handler_->getActiveWindow().has_value());
+  EXPECT_EQ(route_handler_->getPreferredLanelets().size(), full_lanelets.size());
+}
+
+TEST_F(TestRouteHandler, activeWindowForAnotherRouteOrOutOfRangeIsRefused)
+{
+  const auto full_size = route_handler_->getPreferredLanelets().size();
+  auto other_uuid = route_handler_->getRouteUuid();
+  other_uuid.uuid.at(0) ^= 0xFF;
+  EXPECT_FALSE(route_handler_->setActiveWindow(other_uuid, 0, 0));
+  EXPECT_FALSE(route_handler_->getActiveWindow().has_value());
+  EXPECT_EQ(route_handler_->getPreferredLanelets().size(), full_size);
+
+  const auto uuid = route_handler_->getRouteUuid();
+  EXPECT_FALSE(route_handler_->setActiveWindow(uuid, 0, 100000));
+  EXPECT_FALSE(route_handler_->setActiveWindow(uuid, 2, 1));
+  EXPECT_EQ(route_handler_->getPreferredLanelets().size(), full_size);
+
+  // a valid window, then an invalid one, falls back to the full route
+  ASSERT_TRUE(route_handler_->setActiveWindow(uuid, 0, 0));
+  EXPECT_FALSE(route_handler_->setActiveWindow(other_uuid, 0, 0));
+  EXPECT_EQ(route_handler_->getPreferredLanelets().size(), full_size);
 }
 
 TEST_F(TestRouteHandler, getGoalLaneId)

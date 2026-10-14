@@ -287,6 +287,10 @@ void RouteHandler::setRoute(const LaneletRoute & route_msg)
     if (!route_ptr_ || route_ptr_->uuid != route_msg.uuid) {
       original_start_pose_ = route_msg.start_pose;
       original_goal_pose_ = route_msg.goal_pose;
+      active_window_.reset();  // a window belongs to one route
+    }
+    if (active_window_ && active_window_->second >= route_msg.segments.size()) {
+      active_window_.reset();
     }
     route_ptr_ = std::make_shared<LaneletRoute>(route_msg);
     is_handler_ready_ = false;
@@ -439,8 +443,39 @@ void RouteHandler::clearRoute()
   start_lanelets_.clear();
   goal_lanelets_.clear();
   reversed_in_route_.clear();
+  active_window_.reset();
   route_ptr_ = nullptr;
   is_handler_ready_ = false;
+}
+
+bool RouteHandler::setActiveWindow(
+  const UUID & route_uuid, const size_t begin_segment, const size_t end_segment)
+{
+  const bool valid = route_ptr_ && route_ptr_->uuid == route_uuid &&
+                     begin_segment <= end_segment && end_segment < route_ptr_->segments.size();
+  if (!valid) {
+    clearActiveWindow();
+    return false;
+  }
+  const auto window = std::make_pair(begin_segment, end_segment);
+  if (active_window_ != window) {
+    active_window_ = window;
+    setLaneletsFromRouteMsg();
+  }
+  return true;
+}
+
+void RouteHandler::clearActiveWindow()
+{
+  if (active_window_) {
+    active_window_.reset();
+    setLaneletsFromRouteMsg();
+  }
+}
+
+std::optional<std::pair<size_t, size_t>> RouteHandler::getActiveWindow() const
+{
+  return active_window_;
 }
 
 void RouteHandler::setAllowReverseRoute(bool allow)
@@ -561,13 +596,22 @@ void RouteHandler::setLaneletsFromRouteMsg()
   // out and re-applied via .invert() -- otherwise a route loaded from a message (as opposed to
   // one just computed in-process by planPathLaneletsBetweenCheckpoints()) would silently lose
   // direction. Also repopulates the reversed_in_route_ side-table so it round-trips correctly.
-  for (const auto & route_section : route_ptr_->segments) {
+  for (size_t segment_idx = 0; segment_idx < route_ptr_->segments.size(); ++segment_idx) {
+    const auto & route_section = route_ptr_->segments.at(segment_idx);
+    // The active window, if set, limits which segments geometric queries see.  The direction
+    // side-table stays complete: it describes the whole route.
+    const bool in_window =
+      !active_window_ ||
+      (active_window_->first <= segment_idx && segment_idx <= active_window_->second);
     for (const auto & primitive : route_section.primitives) {
       const auto id = primitive.id;
+      reversed_in_route_[id] = route_section.is_reversed;
+      if (!in_window) {
+        continue;
+      }
       const lanelet::ConstLanelet forward_llt = lanelet_map_ptr_->laneletLayer.get(id);
       const lanelet::ConstLanelet llt =
         route_section.is_reversed ? forward_llt.invert() : forward_llt;
-      reversed_in_route_[id] = route_section.is_reversed;
       route_lanelets_.push_back(llt);
       rtree_nodes.emplace_back(
         boost::geometry::return_envelope<autoware_utils_geometry::Box2d>(
@@ -703,7 +747,9 @@ lanelet::Id RouteHandler::getGoalLaneId() const
 bool RouteHandler::getGoalLanelet(lanelet::ConstLanelet * goal_lanelet) const
 {
   const lanelet::Id goal_lane_id = getGoalLaneId();
-  for (const auto & llt : route_lanelets_) {
+  // goal_lanelets_, not route_lanelets_: the latter may be limited to an active window that does
+  // not reach the goal yet.
+  for (const auto & llt : goal_lanelets_) {
     if (llt.id() == goal_lane_id) {
       *goal_lanelet = llt;
       return true;

@@ -89,6 +89,26 @@ public:
   void setRouteLanelets(const lanelet::ConstLanelets & path_lanelets);
   void clearRoute();
 
+  /**
+   * @brief Restrict the route lanelets used for geometric queries to segments
+   *        [begin_segment, end_segment] (both inclusive) of the current route.
+   * @details A route that passes over the same ground twice (an out-and-back on overlapping
+   *          lanelets) makes every lookup that goes by position ambiguous: ego lies inside a
+   *          lanelet of each pass.  With a window set, getRouteLanelets(), getPreferredLanelets(),
+   *          the *WithinRoute lookups and getLaneletSequence() see only the window's segments.
+   *          Goal and start queries (getGoalLanelet(), isInGoalRouteSection(), the start/goal
+   *          bounds of the *WithinRoute walks) keep using the full route.
+   * @return false, with the full route in use, if route_uuid is not the current route's or the
+   *         range is not within its segments.
+   */
+  bool setActiveWindow(const UUID & route_uuid, size_t begin_segment, size_t end_segment);
+
+  /// Use the full route again for geometric queries.
+  void clearActiveWindow();
+
+  /// The window in use, if any.
+  std::optional<std::pair<size_t, size_t>> getActiveWindow() const;
+
   // Bidirectional-driving support (see bidirectional_plan/04-routing-foundation.md).
   // Gates whether planPathLaneletsBetweenCheckpoints() is allowed to return a path that
   // traverses an inverted (reverse-direction) lanelet at all. Defaults to false so existing
@@ -413,6 +433,7 @@ private:
   std::shared_ptr<const lanelet::routing::RoutingGraphContainer> overall_graphs_ptr_;
   lanelet::LaneletMapPtr lanelet_map_ptr_;
   lanelet::ConstLanelets route_lanelets_;
+  std::optional<std::pair<size_t, size_t>> active_window_;
   RouteRtree route_lanelets_rtree_;
   lanelet::ConstLanelets preferred_lanelets_;
   lanelet::ConstLanelets start_lanelets_;
