@@ -486,6 +486,15 @@ void VelocitySmootherNode::onCurrentTrajectory(const Trajectory::ConstSharedPtr 
   // Set 0 at the end of the trajectory
   input_points.back().longitudinal_velocity_mps = 0.0;
 
+  // the heading to search with this cycle, from the trajectory as received (signed velocities)
+  search_pose_ = current_odometry_ptr_->pose.pose;
+  {
+    const size_t ego_idx = autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
+      input_points, current_odometry_ptr_->pose.pose, node_param_.ego_nearest_dist_threshold,
+      node_param_.ego_nearest_yaw_threshold);
+    search_pose_.orientation = input_points.at(ego_idx).pose.orientation;
+  }
+
   // calculate prev closest point
   if (!prev_output_.empty()) {
     current_closest_point_from_prev_output_ = calcProjectedTrajectoryPointFromEgo(prev_output_);
@@ -622,7 +631,7 @@ void VelocitySmootherNode::onCurrentTrajectory(const Trajectory::ConstSharedPtr 
 
   // Note that output velocity is resampled by linear interpolation
   auto output_resampled = resampling::resampleTrajectory(
-    output, current_odometry_ptr_->twist.twist.linear.x, current_odometry_ptr_->pose.pose,
+    output, current_odometry_ptr_->twist.twist.linear.x, search_pose_,
     node_param_.ego_nearest_dist_threshold, node_param_.ego_nearest_yaw_threshold,
     node_param_.post_resample_param, false);
 
@@ -756,8 +765,8 @@ bool VelocitySmootherNode::smoothVelocity(
 
   // Resample trajectory with ego-velocity based interval distance
   auto traj_resampled = smoother_->resampleTrajectory(
-    traj_steering_rate_limited, current_odometry_ptr_->twist.twist.linear.x,
-    current_odometry_ptr_->pose.pose, node_param_.ego_nearest_dist_threshold,
+    traj_steering_rate_limited, current_odometry_ptr_->twist.twist.linear.x, search_pose_,
+    node_param_.ego_nearest_dist_threshold,
     node_param_.ego_nearest_yaw_threshold);
 
   const size_t traj_resampled_closest = findNearestIndexFromEgo(traj_resampled);
@@ -769,7 +778,7 @@ bool VelocitySmootherNode::smoothVelocity(
 
   // Publish Closest Resample Trajectory Velocity
   publishClosestVelocity(
-    traj_resampled, current_odometry_ptr_->pose.pose, debug_closest_max_velocity_);
+    traj_resampled, search_pose_, debug_closest_max_velocity_);
 
   // Clip trajectory from closest point
   TrajectoryPoints clipped;
@@ -1055,7 +1064,7 @@ void VelocitySmootherNode::applyExternalVelocityLimit(TrajectoryPoints & traj) c
     0, traj.size(), max_velocity_with_deceleration_, traj);
 
   // insert the point at the distance of external velocity limit
-  const auto & current_pose = current_odometry_ptr_->pose.pose;
+  const auto & current_pose = search_pose_;
   const size_t closest_seg_idx =
     autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
       traj, current_pose, node_param_.ego_nearest_dist_threshold,
@@ -1122,7 +1131,7 @@ void VelocitySmootherNode::publishDebugTrajectories(
     pub_backward_filtered_trajectory_->publish(toTrajectoryMsg(debug_trajectories_tmp.at(1)));
     pub_merged_filtered_trajectory_->publish(toTrajectoryMsg(debug_trajectories_tmp.at(2)));
     publishClosestVelocity(
-      debug_trajectories_tmp.at(2), current_odometry_ptr_->pose.pose, pub_closest_merged_velocity_);
+      debug_trajectories_tmp.at(2), search_pose_, pub_closest_merged_velocity_);
   }
 }
 
@@ -1229,7 +1238,7 @@ Trajectory VelocitySmootherNode::toTrajectoryMsg(
 size_t VelocitySmootherNode::findNearestIndexFromEgo(const TrajectoryPoints & points) const
 {
   return autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
-    points, current_odometry_ptr_->pose.pose, node_param_.ego_nearest_dist_threshold,
+    points, search_pose_, node_param_.ego_nearest_dist_threshold,
     node_param_.ego_nearest_yaw_threshold);
 }
 
@@ -1308,7 +1317,7 @@ TrajectoryPoint VelocitySmootherNode::calcProjectedTrajectoryPoint(
 TrajectoryPoint VelocitySmootherNode::calcProjectedTrajectoryPointFromEgo(
   const TrajectoryPoints & trajectory) const
 {
-  return calcProjectedTrajectoryPoint(trajectory, current_odometry_ptr_->pose.pose);
+  return calcProjectedTrajectoryPoint(trajectory, search_pose_);
 }
 
 }  // namespace autoware::velocity_smoother

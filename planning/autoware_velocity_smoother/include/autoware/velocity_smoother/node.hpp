@@ -114,6 +114,15 @@ private:
   boost::optional<TrajectoryPoint> prev_closest_point_{};
   boost::optional<TrajectoryPoint> current_closest_point_from_prev_output_{};
 
+  // Ego's position with the heading of the trajectory point ego is on.  Every nearest-point search
+  // here uses it rather than the odometry pose: a reversed trajectory has its velocities flipped
+  // positive before smoothing, so motion_utils can no longer tell it is driven in reverse, and on
+  // a path whose yaw is the direction of travel (reverse_lane_follow) ego's nose then matched a
+  // leg running the other way beside ego (hibikino_kanan 347 / 195 at the U-turn): the output
+  // was cut from that leg and the controller swung onto it.  The point is found once per cycle
+  // on the input as received, signed velocities intact.
+  geometry_msgs::msg::Pose search_pose_{};
+
   bool is_reverse_;
 
   // check if the vehicle is under control of the planning module
