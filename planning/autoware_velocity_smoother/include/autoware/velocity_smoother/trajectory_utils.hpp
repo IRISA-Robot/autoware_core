@@ -66,6 +66,19 @@ std::vector<double> calcVelocityProfileWithConstantJerkAndAccelerationLimit(
 
 double calcStopDistance(const TrajectoryPoints & trajectory, const size_t closest);
 
+/**
+ * @brief carry the velocity and acceleration of `smoothed` onto the points of `geometry`.
+ *
+ * `smoothed` must be a resample of `geometry` (every point on it, in the same order, both
+ * starting at the same point).  Each smoothed point is located on `geometry` by a forward-only
+ * search, so a later leg of the path that passes close by (U-turn, out-and-back route) is never
+ * taken.  The result has the poses of `geometry` up to the last smoothed point.
+ * @return nullopt when a smoothed point is farther than `max_deviation` [m] from `geometry`
+ */
+std::optional<TrajectoryPoints> transferVelocityToGeometry(
+  const TrajectoryPoints & geometry, const TrajectoryPoints & smoothed,
+  const double max_deviation);
+
 }  // namespace autoware::velocity_smoother::trajectory_utils
 
 #endif  // AUTOWARE__VELOCITY_SMOOTHER__TRAJECTORY_UTILS_HPP_

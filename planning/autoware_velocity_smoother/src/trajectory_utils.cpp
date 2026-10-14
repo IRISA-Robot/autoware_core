@@ -20,8 +20,10 @@
 #include <autoware_utils_geometry/geometry.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -470,6 +472,96 @@ double calcStopDistance(const TrajectoryPoints & trajectory, const size_t closes
     autoware_utils_geometry::calc_distance2d(trajectory.at(*idx), trajectory.at(closest));
 
   return stop_dist;
+}
+
+std::optional<TrajectoryPoints> transferVelocityToGeometry(
+  const TrajectoryPoints & geometry, const TrajectoryPoints & smoothed,
+  const double max_deviation)
+{
+  if (geometry.size() < 2 || smoothed.size() < 2) {
+    return std::nullopt;
+  }
+
+  const auto s_geometry = calcArclengthArray(geometry);
+
+  // arc length of every smoothed point along `geometry`
+  constexpr double on_path_dist = 0.05;  // [m] a resampled point is on the path within this
+  constexpr double search_margin = 2.0;  // [m]
+  std::vector<double> s_smoothed;
+  s_smoothed.reserve(smoothed.size());
+  size_t seg = 0;
+  double s_prev = 0.0;
+  for (size_t k = 0; k < smoothed.size(); ++k) {
+    const auto & p = smoothed.at(k).pose.position;
+    // the arc between two resampled points is at most a few times their chord, even on a hairpin
+    const double chord =
+      k == 0 ? 0.0 : autoware_utils_geometry::calc_distance2d(smoothed.at(k - 1).pose, p);
+    const double s_max = s_prev + 3.0 * chord + search_margin;
+
+    double best_dist = std::numeric_limits<double>::max();
+    double best_s = s_prev;
+    size_t best_seg = seg;
+    for (size_t i = seg; i + 1 < geometry.size() && s_geometry.at(i) <= s_max; ++i) {
+      const auto & a = geometry.at(i).pose.position;
+      const auto & b = geometry.at(i + 1).pose.position;
+      const double len = s_geometry.at(i + 1) - s_geometry.at(i);
+      double t = 0.0;
+      if (len > 1e-6) {
+        t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / (len * len);
+        t = std::clamp(t, 0.0, 1.0);
+      }
+      const double dist =
+        std::hypot(a.x + t * (b.x - a.x) - p.x, a.y + t * (b.y - a.y) - p.y);
+      const double s = std::max(s_geometry.at(i) + t * len, s_prev);
+      if (dist < best_dist) {
+        best_dist = dist;
+        best_s = s;
+        best_seg = i;
+      }
+      if (dist < on_path_dist) {
+        break;  // the first match going forward is this pass, not a later leg nearby
+      }
+    }
+    if (best_dist > max_deviation) {
+      return std::nullopt;
+    }
+    s_smoothed.push_back(best_s);
+    s_prev = best_s;
+    seg = best_seg;
+  }
+
+  // velocity and acceleration at arc length s, linear between smoothed points
+  size_t k = 0;
+  const auto interpolate = [&](const double s, TrajectoryPoint & out) {
+    while (k + 2 < s_smoothed.size() && s_smoothed.at(k + 1) < s) {
+      ++k;
+    }
+    const auto & p0 = smoothed.at(k);
+    const auto & p1 = smoothed.at(k + 1);
+    const double ds = s_smoothed.at(k + 1) - s_smoothed.at(k);
+    const double r = ds > 1e-6 ? std::clamp((s - s_smoothed.at(k)) / ds, 0.0, 1.0) : 1.0;
+    out.longitudinal_velocity_mps = static_cast<float>(
+      p0.longitudinal_velocity_mps + r * (p1.longitudinal_velocity_mps - p0.longitudinal_velocity_mps));
+    out.acceleration_mps2 = static_cast<float>(
+      p0.acceleration_mps2 + r * (p1.acceleration_mps2 - p0.acceleration_mps2));
+  };
+
+  const double s_end = s_smoothed.back();
+  TrajectoryPoints output;
+  output.reserve(geometry.size());
+  for (size_t i = 0; i < geometry.size() && s_geometry.at(i) <= s_end + 1e-3; ++i) {
+    auto point = geometry.at(i);
+    const bool is_stop = point.longitudinal_velocity_mps == 0.0;
+    interpolate(s_geometry.at(i), point);
+    if (is_stop) {
+      point.longitudinal_velocity_mps = 0.0;  // a stop of the input stays exactly where it is
+    }
+    output.push_back(point);
+  }
+  if (s_geometry.at(output.size() - 1) < s_end - 1e-3) {
+    output.push_back(smoothed.back());
+  }
+  return output;
 }
 
 }  // namespace trajectory_utils

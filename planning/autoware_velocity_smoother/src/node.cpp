@@ -807,6 +807,22 @@ bool VelocitySmootherNode::smoothVelocity(
   // Set 0 velocity after input-stop-point
   overwriteStopPoint(clipped, traj_smoothed);
 
+  // Publish the path's own geometry, not the optimizer's.  The optimizer runs on a resample that
+  // is dense only for the first resample_time seconds and then one point every
+  // sparse_min_interval_distance [m]; the post-resample splines through those points and cuts
+  // (and overshoots) any corner tighter than that spacing.  A 1.25 m-radius U-turn 10 m ahead
+  // came out with a 100 deg kink, the validator's relative_angle check failed and MRM fired.
+  constexpr double max_deviation_from_path = 0.5;  // [m] resampled points are on it within cm
+  if (
+    const auto on_path = trajectory_utils::transferVelocityToGeometry(
+      clipped, traj_smoothed, max_deviation_from_path)) {
+    traj_smoothed = *on_path;
+  } else {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *clock_, 3000,
+      "smoothed trajectory is off the input path, publishing the optimizer geometry");
+  }
+
   traj_smoothed.insert(
     traj_smoothed.begin(), traj_resampled.begin(), traj_resampled.begin() + traj_resampled_closest);
 
