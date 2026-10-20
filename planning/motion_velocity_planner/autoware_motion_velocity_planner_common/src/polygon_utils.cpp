@@ -20,6 +20,7 @@
 #include <autoware_utils_geometry/geometry.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -318,8 +319,53 @@ std::vector<double> calc_front_outer_wheel_off_tracking(
   return front_outer_wheel_off_track;
 }
 
+namespace
+{
+// reverse_lane_follow writes reverse paths with yaw = direction of travel and a negative
+// velocity, while every footprint here is laid out on the body heading.  Built on the travel
+// yaw, a reverse footprint is flipped end for end (0.9 m sticking out where the 0.3 m rear
+// overhang is), and calculate_error_poses() sees a 180 deg yaw error against ego and swings the
+// blended footprints sideways through the turn.  walkot, reversing out of lanelet 39: the hull
+// reached 1 m past the robot's nose and down onto the object at (3.38, -5.45), and
+// obstacle_stop put its stop line behind the robot.
+//
+// A point is in that convention when its velocity is negative and its yaw points along the path
+// (towards the next point).  Such points get yaw + pi; a zero-velocity point (the goal, the
+// extension past it) follows the point before it.  Reverse paths already on the body heading
+// (freespace) have their yaw against the travel direction and are left alone.
+std::vector<TrajectoryPoint> to_body_heading(const std::vector<TrajectoryPoint> & traj_points)
+{
+  auto body_points = traj_points;
+  bool prev_flipped = false;
+  for (size_t i = 0; i < traj_points.size(); ++i) {
+    const double v = traj_points.at(i).longitudinal_velocity_mps;
+    bool flip = false;
+    if (v < 0.0) {
+      const auto & from = traj_points.at(i + 1 < traj_points.size() ? i : i - 1).pose.position;
+      const auto & to = traj_points.at(i + 1 < traj_points.size() ? i + 1 : i).pose.position;
+      const double dx = to.x - from.x;
+      const double dy = to.y - from.y;
+      if (std::hypot(dx, dy) > 1e-3) {
+        const double yaw = tf2::getYaw(traj_points.at(i).pose.orientation);
+        flip = std::cos(yaw) * dx + std::sin(yaw) * dy > 0.0;
+      } else {
+        flip = prev_flipped;
+      }
+    } else if (v == 0.0) {
+      flip = prev_flipped;
+    }
+    if (flip) {
+      body_points.at(i).pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(
+        tf2::getYaw(traj_points.at(i).pose.orientation) + M_PI);
+    }
+    prev_flipped = flip;
+  }
+  return body_points;
+}
+}  // namespace
+
 std::vector<Polygon2d> create_one_step_polygons(
-  const std::vector<TrajectoryPoint> & traj_points, const VehicleInfo & vehicle_info,
+  const std::vector<TrajectoryPoint> & input_traj_points, const VehicleInfo & vehicle_info,
   const geometry_msgs::msg::Pose & current_ego_pose, const double lat_margin,
   const bool enable_to_consider_current_pose, const double time_to_convergence,
   [[maybe_unused]] const double decimate_trajectory_step_length,
@@ -329,6 +375,7 @@ std::vector<Polygon2d> create_one_step_polygons(
   const double front_length = vehicle_info.max_longitudinal_offset_m;
   const double rear_length = vehicle_info.rear_overhang_m;
   const double half_width = vehicle_info.vehicle_width_m / 2.0;
+  const auto traj_points = to_body_heading(input_traj_points);
 
   const auto error_poses =
     enable_to_consider_current_pose
