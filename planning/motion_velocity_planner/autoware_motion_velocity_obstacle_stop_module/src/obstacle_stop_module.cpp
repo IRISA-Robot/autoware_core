@@ -318,8 +318,28 @@ VelocityPlanningResult ObstacleStopModule::plan(
   // 1. init variables
   stop_watch_.tic();
   debug_data_ptr_ = std::make_shared<DebugData>();
-  const double x_offset_to_bumper =
-    calc_x_offset_to_bumper(planner_data->is_driving_forward, planner_data->vehicle_info_);
+  // [REVERSE-STOP-OFFSET 2026-11-05] reverse_lane_follow paths carry yaw = direction of travel with
+  // a negative velocity, so is_driving_forward (decided from the yaw) is true while the robot backs
+  // up. The offset is applied along that yaw, i.e. already towards the travel direction, but its
+  // length was the front bumper's (0.9 m) while the leading edge is the rear bumper (0.3 m): the
+  // stop line sat 0.6 m further from the obstacle than when driving forward, right inside
+  // obstacle_cruise's following distance, and the robot went stop-go behind a slow walker.
+  // The plan's velocity sign at ego says which way the robot really moves.
+  const bool is_reversing = [&]() {
+    if (!raw_trajectory_points.empty()) {
+      const size_t ego_idx = planner_data->find_index(
+        raw_trajectory_points, planner_data->current_odometry.pose.pose);
+      for (size_t i = ego_idx; i < raw_trajectory_points.size(); ++i) {
+        const double v = raw_trajectory_points.at(i).longitudinal_velocity_mps;
+        if (std::abs(v) > 1e-3) {
+          return v < 0.0;
+        }
+      }
+    }
+    return planner_data->current_odometry.twist.twist.linear.x < 0.0;
+  }();
+  const double x_offset_to_bumper = calc_x_offset_to_bumper(
+    planner_data->is_driving_forward && !is_reversing, planner_data->vehicle_info_);
   stop_planning_debug_info_.reset();
   stop_planning_debug_info_.set(
     StopPlanningDebugInfo::TYPE::EGO_VELOCITY, planner_data->current_odometry.twist.twist.linear.x);
