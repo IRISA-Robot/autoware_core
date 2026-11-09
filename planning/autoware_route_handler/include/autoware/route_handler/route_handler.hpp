@@ -117,6 +117,22 @@ public:
   // README / mission planner wiring.
   void setAllowReverseRoute(bool allow);
 
+  // [TURN-IN-PLACE 2026-11-05] How planPathLaneletsBetweenCheckpoints() uses ego's start heading.
+  //   "forward" (default, legacy): a start lanelet is only a candidate (forward AND the inverted
+  //             reverse-start one) when ego's yaw is within 90 deg of the lanelet's FORWARD
+  //             tangent, and the yaw difference is added to the route cost.
+  //   "any":    heading never rejects a start lanelet nor adds cost -- the vehicle rotates in place
+  //             before it drives, so the cheapest route by length wins (the reverse length penalty
+  //             still applies to inverted-start candidates).
+  // Unknown values fall back to "forward" with a warning. Returns false on an unknown value.
+  bool setReverseStartHeadingCheck(const std::string & mode);
+
+  // [TURN-IN-PLACE 2026-11-05] Pure helper behind the "forward"/"any" start-heading policy.
+  // Returns whether a start lanelet with the given |yaw - forward tangent| (rad, already
+  // normalized and absolute) may be used as a route-start candidate.
+  static bool isStartHeadingAccepted(
+    const bool heading_check_any, const double angle_diff, const double yaw_threshold);
+
   // prefer_lateral_ratio blending: distance (meters) over which the reference-path lateral bias
   // ramps between two adjacent lanelets carrying different prefer_lateral_ratio values, applied
   // at both ends of each lanelet in getCenterLinePath(). See
@@ -451,6 +467,10 @@ private:
   // Gates whether planPathLaneletsBetweenCheckpoints() may return a path containing an inverted
   // lanelet at all. Defaults to false (backward compatible). Consumed via setAllowReverseRoute().
   bool allow_reverse_route_{false};
+
+  // [TURN-IN-PLACE 2026-11-05] true <=> reverse_start_heading_check == "any". Default false
+  // ("forward") keeps the legacy heading gate. Consumed via setReverseStartHeadingCheck().
+  bool start_heading_check_any_{false};
 
   // Blend distance (meters) for prefer_lateral_ratio transitions at lanelet boundaries in
   // getCenterLinePath(). Defaults to 4.0m. Consumed via setPreferLateralRatioBlendDistance().

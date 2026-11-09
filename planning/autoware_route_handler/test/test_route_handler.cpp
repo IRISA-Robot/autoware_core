@@ -15,13 +15,17 @@
 #include "test_route_handler.hpp"
 
 
+#include <autoware_lanelet2_extension/utility/message_conversion.hpp>
 #include <autoware_utils_geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+
+#include <lanelet2_core/LaneletMap.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 namespace autoware::route_handler::test
 {
@@ -406,5 +410,155 @@ TEST_F(TestRouteHandler, testGetShoulderLaneletsAtPose)
   pose.position.y = 73768.6;
   shoulder_lanelets = route_handler_->getShoulderLaneletsAtPose(pose);
   ASSERT_TRUE(shoulder_lanelets.empty());
+}
+
+// [TURN-IN-PLACE 2026-11-05] reverse_start_heading_check
+namespace
+{
+// Two straight lanelets A (x in [0,10]) -> B (x in [10,20]) along +x, both one_way=no +
+// bidirectional_driving=yes, so the only way from B back to A is the inverted chain.
+struct BidirTestMap
+{
+  LaneletMapBin bin;
+  lanelet::Id id_a{};
+  lanelet::Id id_b{};
+};
+
+BidirTestMap make_bidirectional_two_lane_map()
+{
+  lanelet::Id next_id = 1;
+  auto pt = [&](double x, double y) { return lanelet::Point3d(next_id++, x, y, 0.0); };
+  const auto l0 = pt(0.0, 1.5);
+  const auto l1 = pt(10.0, 1.5);
+  const auto l2 = pt(20.0, 1.5);
+  const auto r0 = pt(0.0, -1.5);
+  const auto r1 = pt(10.0, -1.5);
+  const auto r2 = pt(20.0, -1.5);
+  auto ls = [&](const lanelet::Points3d & pts) { return lanelet::LineString3d(next_id++, pts); };
+  const auto left_a = ls({l0, l1});
+  const auto right_a = ls({r0, r1});
+  const auto left_b = ls({l1, l2});
+  const auto right_b = ls({r1, r2});
+  auto make_llt = [&](const lanelet::LineString3d & left, const lanelet::LineString3d & right) {
+    lanelet::Lanelet llt(next_id++, left, right);
+    llt.attributes()[lanelet::AttributeName::Type] = lanelet::AttributeValueString::Lanelet;
+    llt.attributes()[lanelet::AttributeName::Subtype] = lanelet::AttributeValueString::Road;
+    llt.attributes()[lanelet::AttributeName::Location] = lanelet::AttributeValueString::Urban;
+    llt.attributes()[lanelet::AttributeName::OneWay] = "no";
+    llt.attributes()["bidirectional_driving"] = "yes";
+    return llt;
+  };
+  auto llt_a = make_llt(left_a, right_a);
+  auto llt_b = make_llt(left_b, right_b);
+  auto map = std::make_shared<lanelet::LaneletMap>();
+  map->add(llt_a);
+  map->add(llt_b);
+
+  BidirTestMap out;
+  lanelet::utils::conversion::toBinMsg(map, &out.bin);
+  out.id_a = llt_a.id();
+  out.id_b = llt_b.id();
+  return out;
+}
+
+geometry_msgs::msg::Pose make_pose(const double x, const double y, const double yaw)
+{
+  geometry_msgs::msg::Pose pose;
+  pose.position = autoware_utils_geometry::create_point(x, y, 0.0);
+  pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(yaw);
+  return pose;
+}
+}  // namespace
+
+TEST(RouteHandlerStartHeading, isStartHeadingAcceptedPureFunction)
+{
+  const double th = M_PI / 2.0;
+  EXPECT_TRUE(RouteHandler::isStartHeadingAccepted(false, 0.1, th));
+  EXPECT_TRUE(RouteHandler::isStartHeadingAccepted(false, th, th));
+  EXPECT_FALSE(RouteHandler::isStartHeadingAccepted(false, M_PI, th));
+  EXPECT_TRUE(RouteHandler::isStartHeadingAccepted(true, M_PI, th));
+  EXPECT_TRUE(RouteHandler::isStartHeadingAccepted(true, 0.0, th));
+}
+
+TEST(RouteHandlerStartHeading, setterRejectsUnknownValueAndFallsBackToForward)
+{
+  const auto test_map = make_bidirectional_two_lane_map();
+  RouteHandler rh(test_map.bin);
+  rh.setAllowReverseRoute(true);
+  EXPECT_TRUE(rh.setReverseStartHeadingCheck("any"));
+  EXPECT_FALSE(rh.setReverseStartHeadingCheck("sideways"));
+  // Fell back to "forward": ego in B facing -x (against B's forward tangent) is rejected again.
+  lanelet::ConstLanelets path;
+  EXPECT_FALSE(rh.planPathLaneletsBetweenCheckpoints(
+    make_pose(15.0, 0.0, M_PI), make_pose(5.0, 0.0, M_PI), &path));
+}
+
+TEST(RouteHandlerStartHeading, inverseStartFacingInvertedDirection)
+{
+  // Ego in B facing -x (already nose-first along the inverted chain), goal in A.
+  const auto test_map = make_bidirectional_two_lane_map();
+  const auto start = make_pose(15.0, 0.0, M_PI);
+  const auto goal = make_pose(5.0, 0.0, M_PI);
+
+  {
+    RouteHandler rh(test_map.bin);
+    rh.setAllowReverseRoute(true);
+    ASSERT_TRUE(rh.setReverseStartHeadingCheck("forward"));
+    lanelet::ConstLanelets path;
+    // Legacy: heading is 180 deg off B's forward tangent -> the start is rejected outright.
+    EXPECT_FALSE(rh.planPathLaneletsBetweenCheckpoints(start, goal, &path));
+  }
+  {
+    RouteHandler rh(test_map.bin);
+    rh.setAllowReverseRoute(true);
+    ASSERT_TRUE(rh.setReverseStartHeadingCheck("any"));
+    lanelet::ConstLanelets path;
+    ASSERT_TRUE(rh.planPathLaneletsBetweenCheckpoints(start, goal, &path));
+    ASSERT_EQ(path.size(), 2u);
+    EXPECT_EQ(path.front().id(), test_map.id_b);
+    EXPECT_TRUE(path.front().inverted());
+    EXPECT_EQ(path.back().id(), test_map.id_a);
+    EXPECT_TRUE(path.back().inverted());
+  }
+}
+
+TEST(RouteHandlerStartHeading, forwardRouteWhileFacingBackward)
+{
+  // Ego in A facing -x (backward w.r.t. the lane), goal ahead in B along the forward direction.
+  const auto test_map = make_bidirectional_two_lane_map();
+  const auto start = make_pose(5.0, 0.0, M_PI);
+  const auto goal = make_pose(15.0, 0.0, 0.0);
+  {
+    RouteHandler rh(test_map.bin);
+    rh.setAllowReverseRoute(true);
+    lanelet::ConstLanelets path;
+    // default == "forward"
+    EXPECT_FALSE(rh.planPathLaneletsBetweenCheckpoints(start, goal, &path));
+  }
+  {
+    RouteHandler rh(test_map.bin);
+    rh.setAllowReverseRoute(true);
+    ASSERT_TRUE(rh.setReverseStartHeadingCheck("any"));
+    lanelet::ConstLanelets path;
+    ASSERT_TRUE(rh.planPathLaneletsBetweenCheckpoints(start, goal, &path));
+    ASSERT_EQ(path.size(), 2u);
+    EXPECT_EQ(path.front().id(), test_map.id_a);
+    EXPECT_FALSE(path.front().inverted());
+    EXPECT_EQ(path.back().id(), test_map.id_b);
+    EXPECT_FALSE(path.back().inverted());
+  }
+}
+
+TEST(RouteHandlerStartHeading, forwardModeKeepsLegacyReverseStartWhenAligned)
+{
+  // Ego in B facing +x (aligned with B), goal behind in A: legacy reverse-start still works.
+  const auto test_map = make_bidirectional_two_lane_map();
+  RouteHandler rh(test_map.bin);
+  rh.setAllowReverseRoute(true);
+  lanelet::ConstLanelets path;
+  ASSERT_TRUE(rh.planPathLaneletsBetweenCheckpoints(
+    make_pose(15.0, 0.0, 0.0), make_pose(5.0, 0.0, 0.0), &path));
+  ASSERT_EQ(path.size(), 2u);
+  EXPECT_TRUE(path.front().inverted());
 }
 }  // namespace autoware::route_handler::test

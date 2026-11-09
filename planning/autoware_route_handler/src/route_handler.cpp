@@ -483,6 +483,30 @@ void RouteHandler::setAllowReverseRoute(bool allow)
   allow_reverse_route_ = allow;
 }
 
+bool RouteHandler::setReverseStartHeadingCheck(const std::string & mode)
+{
+  // [TURN-IN-PLACE 2026-11-05] see header.
+  if (mode == "any") {
+    start_heading_check_any_ = true;
+    return true;
+  }
+  start_heading_check_any_ = false;
+  if (mode != "forward") {
+    RCLCPP_WARN(
+      logger_, "reverse_start_heading_check: unknown value '%s', using 'forward'", mode.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool RouteHandler::isStartHeadingAccepted(
+  const bool heading_check_any, const double angle_diff, const double yaw_threshold)
+{
+  // [TURN-IN-PLACE 2026-11-05] "any": the vehicle turns in place before driving, so its current
+  // yaw says nothing about which orientation of the start lanelet it can depart in.
+  return heading_check_any || angle_diff <= std::abs(yaw_threshold);
+}
+
 void RouteHandler::setPreferLateralRatioBlendDistance(const double blend_distance_m)
 {
   prefer_lateral_ratio_blend_distance_m_ = blend_distance_m;
@@ -2445,7 +2469,12 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
     double pose_yaw = tf2::getYaw(start_checkpoint.orientation);
     double angle_diff = std::abs(autoware_utils_math::normalize_radian(lanelet_angle - pose_yaw));
 
-    bool is_proper_angle = angle_diff <= std::abs(yaw_threshold);
+    // [TURN-IN-PLACE 2026-11-05] reverse_start_heading_check="any" accepts every heading (the
+    // robot rotates in place first) and drops the heading term from the cost so the cheapest
+    // route by length wins. "forward" (default) is the unchanged legacy behaviour.
+    bool is_proper_angle =
+      isStartHeadingAccepted(start_heading_check_any_, angle_diff, yaw_threshold);
+    const double heading_cost = start_heading_check_any_ ? 0.0 : angle_diff_weight * angle_diff;
 
     optional_route = routing_graph_ptr_->getRoute(st_llt, goal_lanelet, 0);
     RCLCPP_WARN(
@@ -2498,7 +2527,12 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
     } else {
       is_route_found = true;
       lanelet::ConstLanelet preferred_lane{};
-      if (getClosestPreferredLaneletWithinRoute(start_checkpoint, &preferred_lane)) {
+      // [TURN-IN-PLACE 2026-11-05] In "any" mode the continuity fast path must not lock in the
+      // forward orientation when ego actually faces against it -- let cost decide instead. In
+      // "forward" mode the angle is always proper here, so this is unchanged.
+      const bool facing_forward = angle_diff <= std::abs(yaw_threshold);
+      if (
+        facing_forward && getClosestPreferredLaneletWithinRoute(start_checkpoint, &preferred_lane)) {
         if (st_llt.id() == preferred_lane.id()) {
           shortest_path = optional_route->shortestPath();
           start_lanelet = st_llt;
@@ -2506,7 +2540,7 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
         }
       }
       const double optional_route_length = optional_route->length2d();
-      const double optional_route_cost = optional_route_length + angle_diff_weight * angle_diff;
+      const double optional_route_cost = optional_route_length + heading_cost;
       RCLCPP_DEBUG(
         logger_, "Lanelet ID %ld: Route length = %.1f, Angle Diff = %.4f rad, Route cost = %.2f",
         st_llt.id(), optional_route_length, angle_diff, optional_route_cost);
@@ -2612,7 +2646,7 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
         // forward continuity match.
         const double inv_route_length = inv_optional_route->length2d();
         const double inv_route_cost =
-          reverse_route_length_penalty_factor * inv_route_length + angle_diff_weight * angle_diff;
+          reverse_route_length_penalty_factor * inv_route_length + heading_cost;
         RCLCPP_DEBUG(
           logger_,
           "Lanelet ID %ld (inverted / reverse-start): Route length = %.1f, Angle Diff = %.4f "
@@ -2677,8 +2711,7 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
           is_route_found = true;
           const double inv_goal_route_length = inv_goal_optional_route->length2d();
           const double inv_goal_route_cost =
-            reverse_route_length_penalty_factor * inv_goal_route_length +
-            angle_diff_weight * angle_diff;
+            reverse_route_length_penalty_factor * inv_goal_route_length + heading_cost;
           RCLCPP_DEBUG(
             logger_,
             "Lanelet ID %ld (inverted start + inverted goal, direct reverse): Route length = "
