@@ -32,6 +32,14 @@ if(BUILD_TESTING)
     ${PROJECT_NAME}_lib
   )
   target_include_directories(test_${PROJECT_NAME} PRIVATE src)
+
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_path_guard
+    test/test_path_guard.cpp
+  )
+  target_link_libraries(test_${PROJECT_NAME}_path_guard
+    gtest_main
+    ${PROJECT_NAME}_lib
+  )
 endif()
 
 autoware_ament_auto_package(INSTALL_TO_SHARE

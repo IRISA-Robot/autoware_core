@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "autoware/behavior_velocity_planner/experimental/node.hpp"
+#include "autoware/behavior_velocity_planner/experimental/path_guard.hpp"
 
 #include <autoware/trajectory/utils/find_intervals.hpp>
 #include <autoware/trajectory/utils/pretty_build.hpp>
@@ -319,6 +320,16 @@ void BehaviorVelocityPlannerNode::onTrigger(
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), logger_throttle_interval,
       "Waiting for the initialization of route_handler");
+    return;
+  }
+
+  // A path without geometry (all points at one position) is accepted by pretty_build(), and
+  // Trajectory::restore() on it segfaults -- skip the cycle like a failed conversion.
+  if (is_degenerate_path(input_path_msg->points)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), logger_throttle_interval,
+      "[DEGENERATE-PATH] input path has %zu points and %.4f m length: skipping this cycle",
+      input_path_msg->points.size(), path_arc_length(input_path_msg->points));
     return;
   }
 
