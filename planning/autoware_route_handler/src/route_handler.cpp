@@ -2460,6 +2460,27 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
   // tuning-engineer + a proper param if the exact factor needs field-tuning.
   constexpr double reverse_route_length_penalty_factor = 1.5;
 
+  // A candidate whose start and goal lanelet are the SAME lanelet (in the same orientation) is a
+  // one-lanelet route, and lanelet2 returns it whether the goal lies ahead of the start along that
+  // orientation or behind it. Behind means the route is unusable: the path planner sees ego
+  // already past the goal and plans nothing, so the robot never moves (crazy_test rev_same_ll /
+  // tip_same_ll: 14/14 episodes). Both candidates cost the same (one whole lanelet), so the
+  // forward one always won over the reverse one and its 1.5x penalty. Reject the wrong way here so
+  // the candidate that really runs from start to goal wins.
+  const auto goal_behind_start_on_same_lanelet =
+    [&](const lanelet::ConstLanelet & from, const lanelet::ConstLanelet & to) {
+    if (from.id() != to.id() || from.inverted() != to.inverted()) {
+      return false;
+    }
+    const auto centerline = from.centerline2d();
+    const auto arc = [&](const geometry_msgs::msg::Pose & pose) {
+      return lanelet::geometry::toArcCoordinates(
+               centerline, lanelet::BasicPoint2d(pose.position.x, pose.position.y))
+        .length;
+    };
+    return arc(goal_checkpoint) < arc(start_checkpoint);
+  };
+
   for (const auto & st_llt : start_lanelets) {
     // check if the angle difference between start_checkpoint and start lanelet center line
     // orientation is in yaw_threshold range
@@ -2477,6 +2498,14 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
     const double heading_cost = start_heading_check_any_ ? 0.0 : angle_diff_weight * angle_diff;
 
     optional_route = routing_graph_ptr_->getRoute(st_llt, goal_lanelet, 0);
+    if (optional_route && goal_behind_start_on_same_lanelet(st_llt, goal_lanelet)) {
+      RCLCPP_WARN(
+        logger_,
+        "forward candidate st_llt=%ld rejected: start and goal are on this lanelet and the goal is "
+        "behind the start",
+        st_llt.id());
+      optional_route = lanelet::Optional<lanelet::routing::Route>{};
+    }
     RCLCPP_WARN(
       logger_,
       "[BIDIR-DEBUG] forward candidate: st_llt=%ld found=%s is_proper_angle=%s angle_diff_deg=%.2f "
@@ -2700,7 +2729,15 @@ bool RouteHandler::planPathLaneletsBetweenCheckpoints(
         isBidirectionalDrivingLanelet(goal_lanelet) &&
         !hasDeferredRegulatoryElementForReverse(goal_lanelet)) {
         const lanelet::ConstLanelet inv_goal_llt = goal_lanelet.invert();
-        const auto inv_goal_optional_route = routing_graph_ptr_->getRoute(inv_llt, inv_goal_llt, 0);
+        auto inv_goal_optional_route = routing_graph_ptr_->getRoute(inv_llt, inv_goal_llt, 0);
+        if (inv_goal_optional_route && goal_behind_start_on_same_lanelet(inv_llt, inv_goal_llt)) {
+          RCLCPP_WARN(
+            logger_,
+            "reverse candidate st_llt=%ld rejected: start and goal are on this lanelet and the "
+            "goal is behind the start against it",
+            st_llt.id());
+          inv_goal_optional_route = lanelet::Optional<lanelet::routing::Route>{};
+        }
         RCLCPP_WARN(
           logger_,
           "[BIDIR-DEBUG] reverse-start+reverse-goal candidate (inv_llt -> inv_goal_llt): "
